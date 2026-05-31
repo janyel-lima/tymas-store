@@ -12,10 +12,6 @@ services:
     restart: unless-stopped
     env_file:
       - .env.dev
-    environment:
-      - NODE_ENV=development
-      - PORT=3000
-      - DB_PATH=/app/data/payments.db
     volumes:
       - ./backend:/app
       - /app/node_modules
@@ -45,7 +41,6 @@ services:
       - NODE_ENV=development
       - DB_PATH=/app/data/subscriptions.db
       - API_PORT=3001
-      - BACKEND_INTERNAL_URL=http://backend:3000
     volumes:
       - ./bot-one:/app
       - /app/node_modules

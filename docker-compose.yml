@@ -19,8 +19,15 @@ services:
       - NODE_ENV=production
       - PORT=3000
       - DB_PATH=/app/data/payments.db
+      # FIX: sem esta linha o backend usa o padrão 'http://localhost:3001',
+      # que não resolve na rede Docker interna. O webhook aprovaria o pagamento
+      # no banco mas nunca chamaria o bot → assinatura nunca ativada.
+      - BOT_INTERNAL_URL=http://bot:3001
+      # FIX: BACKEND_URL vem do .env (ex: https://api.seudominio.com).
+      # O compose injeta aqui explicitamente para garantir que o server.js
+      # use o valor correto ao montar notification_url e back_urls do MP.
+      - BACKEND_URL=${BACKEND_URL}
     volumes:
-      # Persistência do SQLite fora do container
       - ./backend/data:/app/data
     ports:
       - '3000:3000'
@@ -58,12 +65,10 @@ services:
       - NODE_ENV=production
       - DB_PATH=/app/data/subscriptions.db
       - API_PORT=3001
-      # Bot acessa o backend via rede interna do Docker
-      - BACKEND_INTERNAL_URL=http://backend:3000
     volumes:
       - ./bot-one/data:/app/data
     ports:
-      # API interna do bot acessível apenas na rede interna
+      # API interna do bot acessível apenas via rede interna Docker
       - '127.0.0.1:3001:3001'
     networks:
       - app-network
@@ -88,9 +93,9 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        # Vite precisa das URLs em build-time
         VITE_BACKEND_URL: ${BACKEND_URL}
         VITE_FRONTEND_URL: ${FRONTEND_URL}
+        VITE_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME}
     image: mp-telegram-frontend:latest
     container_name: mp-frontend
     restart: unless-stopped

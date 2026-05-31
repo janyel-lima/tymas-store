@@ -4,17 +4,21 @@
  *
  * Fluxo de integração:
  *   1. Usuário finaliza pagamento no frontend Vue 3
- *   2. Gateway de pagamento dispara webhook → seu backend (Spring Boot / Node)
+ *   2. Mercado Pago dispara webhook → backend (server.js)
  *   3. Backend confirma o pagamento e chama POST /activate neste servidor
  *   4. Este servidor ativa a assinatura no SQLite e notifica o usuário no Telegram
  *
  * Segurança: todas as rotas (exceto /health) exigem o header X-Api-Secret.
  */
 
-const express    = require('express');
-const { activateSubscription, upsertUser } = require('../database');
+const express = require('express');
+const {
+  activateSubscription,
+  upsertUser,
+  createPaymentRecord, // FIX: importado mas nunca usado — agora registra o pagamento
+} = require('../database');
 
-const API_PORT   = parseInt(process.env.API_PORT ?? '3001', 10);
+const API_PORT = parseInt(process.env.API_PORT ?? '3001', 10);
 const API_SECRET = process.env.API_SECRET;
 
 /**
@@ -24,12 +28,11 @@ const API_SECRET = process.env.API_SECRET;
 function startApiServer(bot) {
   const app = express();
 
-  // Parse JSON em todas as requisições
   app.use(express.json());
 
   // ── Middleware de autenticação por secret ──────────────────
   app.use((req, res, next) => {
-    if (req.path === '/health') return next(); // Health check é público
+    if (req.path === '/health') return next();
 
     if (!API_SECRET) {
       console.warn('[API] ⚠️  API_SECRET não definida — endpoint exposto sem autenticação!');
@@ -54,18 +57,17 @@ function startApiServer(bot) {
    *
    * Body esperado (JSON):
    * {
-   *   "userId":    123456789,   // ID do usuário no Telegram (obrigatório)
-   *   "planDays":  30,          // Dias do plano contratado (obrigatório)
-   *   "amount":    100.00,      // Valor pago em R$ (opcional, para log)
-   *   "username":  "joao123",   // Username do Telegram (opcional)
-   *   "fullName":  "João Silva", // Nome completo (opcional)
+   *   "userId":     123456789,  // ID do usuário no Telegram (obrigatório)
+   *   "planDays":   30,         // Dias do plano contratado (obrigatório)
+   *   "amount":     100.00,     // Valor pago em R$ (opcional)
+   *   "username":   "joao123",  // Username do Telegram (opcional)
+   *   "fullName":   "João",     // Nome completo (opcional)
    *   "paymentRef": "pay_abc"   // ID do pagamento no gateway (opcional)
    * }
    */
   app.post('/activate', async (req, res) => {
     const { userId, planDays, amount, username, fullName, paymentRef } = req.body ?? {};
 
-    // Validação de campos obrigatórios
     if (!userId || !planDays) {
       return res.status(400).json({
         error: 'Campos obrigatórios ausentes: userId, planDays.',
@@ -82,14 +84,34 @@ function startApiServer(bot) {
       // 2. Ativa / renova a assinatura
       const expiresAt = activateSubscription(Number(userId), Number(planDays));
 
+      // 3. FIX: registra o pagamento no histórico do bot com status 'approved'.
+      //    Antes essa linha não existia — o histórico de pagamentos do bot
+      //    ficava sempre vazio, impossibilitando auditoria e relatórios.
+      if (paymentRef) {
+        try {
+          createPaymentRecord(
+            Number(userId),
+            Number(planDays),
+            Number(amount) || 0,
+            paymentRef,
+            'approved'
+          );
+        } catch (dupErr) {
+          // payment_ref tem constraint UNIQUE — ignora duplicata silenciosamente
+          console.warn('[API] Registro de pagamento já existe (duplicata):', paymentRef);
+        }
+      }
+
       console.log(
         `[API] ✅ Assinatura ativada — userId=${userId} | plano=${planDays}d | ` +
-        `expira=${expiresAt.toISOString()} | ref=${paymentRef ?? 'N/A'}`
+          `expira=${expiresAt.toISOString()} | ref=${paymentRef ?? 'N/A'}`
       );
 
-      // 3. Notifica o usuário no Telegram
+      // 4. Notifica o usuário no Telegram
       const expiresFmt = expiresAt.toLocaleDateString('pt-BR', {
-        day: '2-digit', month: '2-digit', year: 'numeric',
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
       });
 
       await bot.telegram.sendMessage(
@@ -109,19 +131,18 @@ function startApiServer(bot) {
       );
 
       return res.status(200).json({
-        success:   true,
+        success: true,
         userId,
         planDays,
         expiresAt: expiresAt.toISOString(),
       });
-
     } catch (err) {
       // Erro do Telegram ao enviar mensagem não deve impedir a ativação
-      if (err.message?.includes('TELEGRAM')) {
+      if (err.message?.includes('TELEGRAM') || err.response?.error_code) {
         console.warn('[API] Assinatura ativada, mas falha ao notificar usuário:', err.message);
         return res.status(200).json({
-          success:  true,
-          warning:  'Assinatura ativada, mas notificação Telegram falhou.',
+          success: true,
+          warning: 'Assinatura ativada, mas notificação Telegram falhou.',
           userId,
           planDays,
         });
@@ -132,11 +153,7 @@ function startApiServer(bot) {
     }
   });
 
-  // ── POST /expire (admin manual) ────────────────────────────
-  /**
-   * Força a verificação manual de expiração (útil para testes/admin).
-   * Requer o mesmo X-Api-Secret.
-   */
+  // ── POST /run-expiration-check (admin manual) ──────────────
   app.post('/run-expiration-check', async (req, res) => {
     try {
       const { runExpirationCheck } = require('../services/cronService');
@@ -152,7 +169,6 @@ function startApiServer(bot) {
     res.status(404).json({ error: 'Rota não encontrada.' });
   });
 
-  // Inicia o servidor
   app.listen(API_PORT, '0.0.0.0', () => {
     console.log(`✅ API interna rodando em http://0.0.0.0:${API_PORT}`);
   });

@@ -8,40 +8,40 @@
 
 require('dotenv').config();
 
-const path       = require('path');
-const express    = require('express');
-const cors       = require('cors');
-const sqlite3    = require('sqlite3').verbose();
+const path = require('path');
+const express = require('express');
+const cors = require('cors');
+const sqlite3 = require('sqlite3').verbose();
 const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
 const { v4: uuidv4 } = require('uuid');
-const axios      = require('axios');
+const axios = require('axios');
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  SEÇÃO 1 — VARIÁVEIS DE AMBIENTE & VALIDAÇÃO NA INICIALIZAÇÃO
+//
+//  CORREÇÃO: Alterado de destructuring puro para atribuição com operador OR (||).
+//  O destructuring falha se a propriedade vier como string vazia ou nula do
+//  ambiente, mantendo valores indesejados. Agora a precedência do .env é absoluta.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const {
-  PORT              = 3000,
-  MP_ACCESS_TOKEN,
-  TELEGRAM_BOT_TOKEN,
-  FRONTEND_URL      = 'http://localhost:5173',
-  BASE_URL          = 'http://localhost:3000',
-  DB_PATH           = './data/payments.db',
-  NODE_ENV          = 'development',
-  // URL interna do bot (dentro da rede Docker: http://bot:3001)
-  // Em dev local sem Docker: http://localhost:3001
-  BOT_INTERNAL_URL  = 'http://localhost:3001',
-  API_SECRET        = '',
-} = process.env;
+const PORT = process.env.PORT || 3000;
+const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_BOT_USERNAME = process.env.TELEGRAM_BOT_USERNAME || '';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3000';
+const DB_PATH = process.env.DB_PATH || './data/payments.db';
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const BOT_INTERNAL_URL = process.env.BOT_INTERNAL_URL || 'http://localhost:3001';
+const API_SECRET = process.env.API_SECRET || '';
 
 if (!MP_ACCESS_TOKEN) {
   console.error('[FATAL] Variável de ambiente MP_ACCESS_TOKEN não definida.');
   process.exit(1);
 }
 
-// Aviso se TELEGRAM_BOT_TOKEN não estiver definido (ainda funciona, mas sem fallback Telegram direto)
 if (!TELEGRAM_BOT_TOKEN) {
-  console.warn('[WARN] TELEGRAM_BOT_TOKEN não definida. Notificações diretas via Telegram desativadas.');
+  console.warn('[WARN] TELEGRAM_BOT_TOKEN não definida. Fallback Telegram direto desativado.');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -50,8 +50,8 @@ if (!TELEGRAM_BOT_TOKEN) {
 
 /** @type {Record<number, { price: number, label: string }>} */
 const PLAN_CATALOG = Object.freeze({
-  7:  { price: 30.0,  label: '7 Dias'  },
-  14: { price: 50.0,  label: '14 Dias' },
+  7: { price: 30.0, label: '7 Dias' },
+  14: { price: 50.0, label: '14 Dias' },
   30: { price: 100.0, label: '30 Dias' },
 });
 
@@ -65,20 +65,19 @@ const mpConfig = new MercadoPagoConfig({
 });
 
 const mpPreference = new Preference(mpConfig);
-const mpPayment    = new Payment(mpConfig);
+const mpPayment = new Payment(mpConfig);
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  SEÇÃO 4 — BANCO DE DADOS SQLITE (wrappers assíncronos)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Garante que o diretório de dados existe
 const fs = require('fs');
 const dataDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dataDir)) {
   fs.mkdirSync(dataDir, { recursive: true });
 }
 
-const db = new sqlite3.Database(DB_PATH, (err) => {
+const db = new sqlite3.Database(DB_PATH, err => {
   if (err) {
     console.error('[DB][FATAL] Falha ao abrir o banco SQLite:', err.message);
     process.exit(1);
@@ -131,15 +130,14 @@ const initDatabase = async () => {
 
 /**
  * Notifica o Bot via API interna para ativar a assinatura do usuário.
- * Essa é a integração principal backend → bot.
  */
 const notifyBotActivation = async ({ userId, planDays, amount, paymentRef }) => {
   const url = `${BOT_INTERNAL_URL}/activate`;
 
   const payload = {
-    userId:     Number(userId),
-    planDays:   Number(planDays),
-    amount:     Number(amount) || 0,
+    userId: Number(userId),
+    planDays: Number(planDays),
+    amount: Number(amount) || 0,
     paymentRef: String(paymentRef),
   };
 
@@ -163,7 +161,6 @@ const notifyBotActivation = async ({ userId, planDays, amount, paymentRef }) => 
 
 /**
  * Fallback: envia mensagem direta via Telegram API caso o bot esteja offline.
- * Garante que o usuário seja notificado mesmo em falha do bot.
  */
 const sendTelegramFallback = async (chatId, plano_dias) => {
   if (!TELEGRAM_BOT_TOKEN) {
@@ -183,11 +180,15 @@ const sendTelegramFallback = async (chatId, plano_dias) => {
 
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
 
-  await axios.post(url, {
-    chat_id:    String(chatId),
-    text,
-    parse_mode: 'HTML',
-  }, { timeout: 6000 });
+  await axios.post(
+    url,
+    {
+      chat_id: String(chatId),
+      text,
+      parse_mode: 'HTML',
+    },
+    { timeout: 6000 }
+  );
 
   console.log(`[TELEGRAM-FALLBACK] Mensagem direta enviada → chat_id=${chatId}`);
 };
@@ -198,28 +199,25 @@ const sendTelegramFallback = async (chatId, plano_dias) => {
 
 const app = express();
 
-// Serve páginas estáticas de /public (sucesso, falha, pendente)
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
 
-// CORS — permite o frontend declarado no .env + localhost em dev
-const allowedOrigins = [
-  FRONTEND_URL,
-  'http://localhost:5173',
-  'http://localhost:3000',
-].filter(Boolean);
+const allowedOrigins = [FRONTEND_URL, 'http://localhost:5173', 'http://localhost:3000'].filter(
+  Boolean
+);
 
-app.use(cors({
-  origin: (origin, callback) => {
-    // Permite requisições sem origin (ex: curl, Postman, webhooks do MP)
-    if (!origin || allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    callback(new Error(`CORS bloqueado para origem: ${origin}`));
-  },
-  methods:        ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-  optionsSuccessStatus: 200,
-}));
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      callback(new Error(`CORS bloqueado para origem: ${origin}`));
+    },
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    optionsSuccessStatus: 200,
+  })
+);
 
 app.use(express.json({ limit: '10kb' }));
 app.use(express.urlencoded({ extended: false, limit: '10kb' }));
@@ -238,8 +236,8 @@ app.use((req, _res, next) => {
 // ── Health Check ──────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
   res.status(200).json({
-    status:    'ok',
-    env:       NODE_ENV,
+    status: 'ok',
+    env: NODE_ENV,
     timestamp: new Date().toISOString(),
   });
 });
@@ -252,7 +250,7 @@ app.post('/api/v1/checkout', async (req, res) => {
     return res.status(400).json({ error: 'O campo "userId" é obrigatório.' });
   }
 
-  const planoInt  = parseInt(plano, 10);
+  const planoInt = parseInt(plano, 10);
   const planEntry = PLAN_CATALOG[planoInt];
 
   if (!planEntry) {
@@ -262,8 +260,8 @@ app.post('/api/v1/checkout', async (req, res) => {
   }
 
   const safeUserId = String(userId).trim();
-  const id         = uuidv4();
-  const now        = new Date().toISOString();
+  const id = uuidv4();
+  const now = new Date().toISOString();
 
   try {
     await dbRun(
@@ -272,33 +270,34 @@ app.post('/api/v1/checkout', async (req, res) => {
       [id, safeUserId, planoInt, now, now]
     );
 
-    console.log(`[CHECKOUT] Registro criado → id=${id} | userId=${safeUserId} | plano=${planoInt}d`);
+    console.log(
+      `[CHECKOUT] Registro criado → id=${id} | userId=${safeUserId} | plano=${planoInt}d`
+    );
 
-    // Monta back_urls apontando para o frontend
     const preferenceBody = {
       items: [
         {
-          id:          id,
-          title:       `Assinatura ${planEntry.label}`,
+          id: id,
+          title: `Assinatura ${planEntry.label}`,
           description: `Acesso premium por ${planoInt} dias via Telegram`,
-          quantity:    1,
-          unit_price:  planEntry.price,
+          quantity: 1,
+          unit_price: planEntry.price,
           currency_id: 'BRL',
         },
       ],
       metadata: {
-        user_id:     safeUserId,
-        plano_dias:  planoInt,
+        user_id: safeUserId,
+        plano_dias: planoInt,
         internal_id: id,
       },
       back_urls: {
-        success: `${FRONTEND_URL}/sucesso?userId=${safeUserId}&plano=${planoInt}`,
-        failure: `${FRONTEND_URL}/falha`,
-        pending: `${FRONTEND_URL}/pendente`,
+        success: `${FRONTEND_URL}/sucesso?userId=${safeUserId}&plano=${planoInt}${TELEGRAM_BOT_USERNAME ? `&bot=${encodeURIComponent(TELEGRAM_BOT_USERNAME)}` : ''}`,
+        failure: `${BACKEND_URL}/falha`,
+        pending: `${BACKEND_URL}/pendente`,
       },
-      auto_return:          'approved',
-      external_reference:   id,
-      notification_url:     `${BASE_URL}/api/v1/webhook`,
+      auto_return: 'approved',
+      external_reference: id,
+      notification_url: `${BACKEND_URL}/api/v1/webhook`,
       statement_descriptor: 'ASSINATURA BOT',
     };
 
@@ -307,11 +306,10 @@ app.post('/api/v1/checkout', async (req, res) => {
     console.log(`[CHECKOUT] Preferência MP criada → prefId=${preference.id}`);
 
     return res.status(201).json({
-      success:    true,
+      success: true,
       payment_id: id,
       init_point: preference.init_point,
     });
-
   } catch (err) {
     const mpError = err?.cause?.message || err?.message || 'Erro desconhecido';
     console.error(`[CHECKOUT][ERROR] id=${id} | Erro: ${mpError}`);
@@ -332,11 +330,8 @@ app.post('/api/v1/checkout', async (req, res) => {
 app.post('/api/v1/webhook', async (req, res) => {
   const body = req.body;
 
-  console.log(
-    `[WEBHOOK] Notificação recebida → type=${body?.type} | data.id=${body?.data?.id}`
-  );
+  console.log(`[WEBHOOK] Notificação recebida → type=${body?.type} | data.id=${body?.data?.id}`);
 
-  // Resposta imediata ao MP (evita timeout e retry)
   res.status(200).json({ received: true });
 
   if (body?.type !== 'payment' || !body?.data?.id) {
@@ -350,18 +345,16 @@ app.post('/api/v1/webhook', async (req, res) => {
     console.log(`[WEBHOOK] Consultando pagamento na API do MP → id=${mpPaymentId}`);
     const paymentData = await mpPayment.get({ id: mpPaymentId });
 
-    console.log(
-      `[WEBHOOK] Dados MP → id=${mpPaymentId} | status=${paymentData.status}`
-    );
+    console.log(`[WEBHOOK] Dados MP → id=${mpPaymentId} | status=${paymentData.status}`);
 
     if (paymentData.status !== 'approved') {
       console.log(`[WEBHOOK] Status "${paymentData.status}" — sem ação.`);
       return;
     }
 
-    const metadata    = paymentData.metadata || {};
-    const user_id     = metadata.user_id;
-    const plano_dias  = metadata.plano_dias;
+    const metadata = paymentData.metadata || {};
+    const user_id = metadata.user_id;
+    const plano_dias = metadata.plano_dias;
     const internal_id = metadata.internal_id;
 
     if (!user_id || !plano_dias || !internal_id) {
@@ -369,10 +362,7 @@ app.post('/api/v1/webhook', async (req, res) => {
       return;
     }
 
-    // Idempotência
-    const existing = await dbGet(
-      `SELECT id, status FROM payments WHERE id = ?`, [internal_id]
-    );
+    const existing = await dbGet(`SELECT id, status FROM payments WHERE id = ?`, [internal_id]);
 
     if (!existing) {
       console.error(`[WEBHOOK][ERROR] internal_id="${internal_id}" não encontrado no banco.`);
@@ -384,9 +374,8 @@ app.post('/api/v1/webhook', async (req, res) => {
       return;
     }
 
-    // Atualiza status no banco
     const updatedAt = new Date().toISOString();
-    const result    = await dbRun(
+    const result = await dbRun(
       `UPDATE payments
           SET status        = 'approved',
               mp_payment_id = ?,
@@ -403,19 +392,15 @@ app.post('/api/v1/webhook', async (req, res) => {
 
     console.log(`[WEBHOOK] Pagamento aprovado → internal_id=${internal_id}`);
 
-    // ── Notifica o bot para ativar a assinatura ───────────────────────────
     try {
       await notifyBotActivation({
-        userId:     user_id,
-        planDays:   plano_dias,
-        amount:     paymentData.transaction_amount,
+        userId: user_id,
+        planDays: plano_dias,
+        amount: paymentData.transaction_amount,
         paymentRef: mpPaymentId,
       });
     } catch (botErr) {
-      // Bot offline? Usa fallback direto via Telegram API
-      console.warn(
-        `[WEBHOOK] Bot inacessível (${botErr.message}). Usando fallback direto.`
-      );
+      console.warn(`[WEBHOOK] Bot inacessível (${botErr.message}). Usando fallback direto.`);
       try {
         await sendTelegramFallback(user_id, plano_dias);
       } catch (fbErr) {
@@ -424,7 +409,6 @@ app.post('/api/v1/webhook', async (req, res) => {
     }
 
     console.log(`[WEBHOOK] Fluxo concluído → internal_id=${internal_id} | user_id=${user_id}`);
-
   } catch (err) {
     console.error(
       `[WEBHOOK][ERROR] Falha ao processar pagamento ${mpPaymentId}: `,
@@ -458,27 +442,27 @@ const bootstrap = async () => {
     const server = app.listen(PORT, () => {
       console.log('═══════════════════════════════════════════════════════');
       console.log(`  🚀  Servidor iniciado na porta ${PORT}`);
-      console.log(`  🌍  Ambiente  : ${NODE_ENV}`);
-      console.log(`  🔗  Frontend  : ${FRONTEND_URL}`);
-      console.log(`  📡  Webhook   : ${BASE_URL}/api/v1/webhook`);
-      console.log(`  🤖  Bot URL   : ${BOT_INTERNAL_URL}`);
+      console.log(`  🌍  Ambiente   : ${NODE_ENV}`);
+      console.log(`  🔗  Frontend   : ${FRONTEND_URL}`);
+      console.log(`  📡  Webhook    : ${BACKEND_URL}/api/v1/webhook`);
+      console.log(`  🤖  Bot URL    : ${BOT_INTERNAL_URL}`);
+      console.log(`  🆔  Bot User   : ${TELEGRAM_BOT_USERNAME || '(não configurado)'}`);
       console.log('═══════════════════════════════════════════════════════');
     });
 
-    const shutdown = (signal) => {
+    const shutdown = signal => {
       console.log(`\n[SERVER] Sinal ${signal} recebido. Encerrando...`);
       server.close(() => {
-        db.close((err) => {
+        db.close(err => {
           if (err) console.error('[DB] Erro ao fechar banco:', err.message);
-          else     console.log('[DB] Banco de dados fechado com segurança.');
+          else console.log('[DB] Banco de dados fechado com segurança.');
           process.exit(0);
         });
       });
     };
 
     process.on('SIGTERM', () => shutdown('SIGTERM'));
-    process.on('SIGINT',  () => shutdown('SIGINT'));
-
+    process.on('SIGINT', () => shutdown('SIGINT'));
   } catch (err) {
     console.error('[FATAL] Falha durante a inicialização do servidor:', err.message);
     process.exit(1);

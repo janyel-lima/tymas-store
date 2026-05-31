@@ -12,24 +12,24 @@
 
 require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
 
-const http  = require('http');
+const http = require('http');
 const https = require('https');
 
-const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
-const userId   = process.argv[2] || '123456789';
-const plano    = parseInt(process.argv[3] || '30', 10);
+const BASE_URL = process.env.BACKEND_URL || 'http://localhost:3000';
+const userId = process.argv[2] || '123456789';
+const plano = parseInt(process.argv[3] || '30', 10);
 
 const payload = JSON.stringify({ userId, plano });
-const url     = new URL('/api/v1/checkout', BASE_URL);
+const url = new URL('/api/v1/checkout', BASE_URL);
 const isHttps = url.protocol === 'https:';
 
 const options = {
   hostname: url.hostname,
-  port:     url.port || (isHttps ? 443 : 80),
-  path:     url.pathname,
-  method:   'POST',
+  port: url.port || (isHttps ? 443 : 80),
+  path: url.pathname,
+  method: 'POST',
   headers: {
-    'Content-Type':   'application/json',
+    'Content-Type': 'application/json',
     'Content-Length': Buffer.byteLength(payload),
   },
 };
@@ -44,9 +44,11 @@ console.log('─'.repeat(46));
 
 const transport = isHttps ? https : http;
 
-const req = transport.request(options, (res) => {
+const req = transport.request(options, res => {
   let data = '';
-  res.on('data', (chunk) => { data += chunk; });
+  res.on('data', chunk => {
+    data += chunk;
+  });
   res.on('end', () => {
     try {
       const json = JSON.parse(data);
@@ -62,7 +64,7 @@ const req = transport.request(options, (res) => {
   });
 });
 
-req.on('error', (err) => {
+req.on('error', err => {
   console.error('❌ Erro na requisição:', err.message);
   console.error('   Certifique-se de que o servidor está rodando.');
   process.exit(1);
