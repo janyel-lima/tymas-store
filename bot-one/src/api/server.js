@@ -12,12 +12,8 @@
  */
 
 const express = require('express');
-const {
-  activateSubscription,
-  upsertUser,
-  createPaymentRecord, // FIX: importado mas nunca usado — agora registra o pagamento
-} = require('../database');
-
+const { activateSubscription, upsertUser, createPaymentRecord } = require('../database');
+const { registerPendingEntry } = require('../bot');
 const API_PORT = parseInt(process.env.API_PORT ?? '3001', 10);
 const API_SECRET = process.env.API_SECRET;
 
@@ -84,9 +80,7 @@ function startApiServer(bot) {
       // 2. Ativa / renova a assinatura
       const expiresAt = activateSubscription(Number(userId), Number(planDays));
 
-      // 3. FIX: registra o pagamento no histórico do bot com status 'approved'.
-      //    Antes essa linha não existia — o histórico de pagamentos do bot
-      //    ficava sempre vazio, impossibilitando auditoria e relatórios.
+      // 3. Registra o pagamento no histórico
       if (paymentRef) {
         try {
           createPaymentRecord(
@@ -97,7 +91,6 @@ function startApiServer(bot) {
             'approved'
           );
         } catch (dupErr) {
-          // payment_ref tem constraint UNIQUE — ignora duplicata silenciosamente
           console.warn('[API] Registro de pagamento já existe (duplicata):', paymentRef);
         }
       }
@@ -107,37 +100,71 @@ function startApiServer(bot) {
           `expira=${expiresAt.toISOString()} | ref=${paymentRef ?? 'N/A'}`
       );
 
-      // 4. Notifica o usuário no Telegram
+      // 4. Gera link de convite único para o canal
+      const GROUP_ID = process.env.GROUP_ID;
+      let inviteLink = null;
+
+      if (GROUP_ID) {
+        try {
+          const expireUnix = Math.floor(expiresAt.getTime() / 1000);
+
+          const linkResult = await bot.telegram.createChatInviteLink(GROUP_ID, {
+            expire_date: expireUnix,
+            member_limit: 1,
+            name: `Sub_${userId}`,
+          });
+
+          inviteLink = linkResult.invite_link;
+          console.log(`[API] 🔗 Link gerado → userId=${userId} | link=${inviteLink}`);
+
+          // ── NOVO: registra userId como aguardando entrada ──
+          registerPendingEntry(userId, {
+            expiresAt,
+            planDays: Number(planDays),
+          });
+          // ──────────────────────────────────────────────────
+        } catch (linkErr) {
+          console.warn('[API] Falha ao gerar link de convite:', linkErr.message);
+        }
+      }
+
+      // 5. Formata data de expiração
       const expiresFmt = expiresAt.toLocaleDateString('pt-BR', {
         day: '2-digit',
         month: '2-digit',
         year: 'numeric',
       });
 
-      await bot.telegram.sendMessage(
-        userId,
-        [
-          '🎉 *Pagamento Confirmado\\!*',
-          '',
-          'Sua assinatura foi ativada com sucesso\\.',
-          '',
-          `*📦 Plano:*       ${planDays} dias`,
-          `*📅 Válido até:*  ${expiresFmt.replace(/\//g, '\\/')}`,
-          '',
-          '_Aproveite o acesso completo à plataforma\\._',
-          '_Em caso de dúvidas, entre em contato com o suporte\\._',
-        ].join('\n'),
-        { parse_mode: 'MarkdownV2' }
-      );
+      // 6. Monta e envia mensagem no Telegram
+      const messageLines = [
+        '🎉 *Pagamento Confirmado\\!*',
+        '',
+        'Sua assinatura foi ativada com sucesso\\.',
+        '',
+        `*📦 Plano:*       ${planDays} dias`,
+        `*📅 Válido até:*  ${expiresFmt.replace(/\//g, '\\/')}`,
+        '',
+      ];
+
+      if (inviteLink) {
+        messageLines.push(`*🔗 Acesse o canal:* [Clique aqui para entrar](${inviteLink})`);
+        messageLines.push('_⚠️ Link de uso único — não compartilhe\\._');
+        messageLines.push('_O acesso é removido automaticamente ao expirar\\._');
+      }
+
+      await bot.telegram.sendMessage(userId, messageLines.join('\n'), {
+        parse_mode: 'MarkdownV2',
+        disable_web_page_preview: true,
+      });
 
       return res.status(200).json({
         success: true,
         userId,
         planDays,
         expiresAt: expiresAt.toISOString(),
+        inviteLink,
       });
     } catch (err) {
-      // Erro do Telegram ao enviar mensagem não deve impedir a ativação
       if (err.message?.includes('TELEGRAM') || err.response?.error_code) {
         console.warn('[API] Assinatura ativada, mas falha ao notificar usuário:', err.message);
         return res.status(200).json({

@@ -11,10 +11,10 @@
 
 require('dotenv').config();
 
-const { bot }             = require('./src/bot');
-const { initDatabase }    = require('./src/database');
-const { startCronJob }    = require('./src/services/cronService');
-const { startApiServer }  = require('./src/api/server');
+const { bot } = require('./src/bot');
+const { initDatabase } = require('./src/database');
+const { startCronJob } = require('./src/services/cronService');
+const { startApiServer } = require('./src/api/server');
 
 async function main() {
   console.log('═══════════════════════════════════════');
@@ -25,19 +25,21 @@ async function main() {
   initDatabase();
   console.log('✅ Banco de dados SQLite pronto.');
 
-  // 2. Servidor HTTP interno (passa o bot para poder enviar mensagens)
+  // 2. Servidor HTTP interno
   startApiServer(bot);
 
-  // 3. Cron de expiração (passa o bot para notificações)
+  // 3. Cron de expiração
   startCronJob(bot);
 
   // 4. Bot (long-polling)
-  await bot.launch();
+  await bot.launch({
+    allowedUpdates: ['message', 'callback_query', 'chat_member'],
+  });
+
   console.log('✅ Bot do Telegram online. Aguardando mensagens...');
   console.log('═══════════════════════════════════════\n');
 
-  // Shutdown gracioso — aguarda updates pendentes antes de encerrar
-  process.once('SIGINT',  () => {
+  process.once('SIGINT', () => {
     console.log('\n⏹  Recebido SIGINT. Encerrando bot...');
     bot.stop('SIGINT');
   });
@@ -47,7 +49,7 @@ async function main() {
   });
 }
 
-main().catch((err) => {
+main().catch(err => {
   console.error('❌ Erro fatal na inicialização:', err);
   process.exit(1);
 });

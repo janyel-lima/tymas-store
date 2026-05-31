@@ -17,11 +17,9 @@ const { getRenewKeyboard } = require('../keyboards');
  */
 function startCronJob(bot) {
   // Expressão cron: "0 0 * * *" → toda meia-noite
-  const task = cron.schedule(
-    '0 0 * * *',
-    async () => runExpirationCheck(bot),
-    { timezone: 'America/Sao_Paulo' }
-  );
+  const task = cron.schedule('0 0 * * *', async () => runExpirationCheck(bot), {
+    timezone: 'America/Sao_Paulo',
+  });
 
   console.log('✅ Cron de expiração agendado: todo dia às 00:00 (America/Sao_Paulo)');
 
@@ -64,28 +62,42 @@ async function runExpirationCheck(bot) {
 
   for (const sub of expired) {
     try {
-      // 1. Atualiza status no banco ANTES de notificar (evita re-notificação em falha)
+      // 1. Atualiza status no banco
       expireSubscription(sub.user_id);
 
-      // 2. Envia mensagem privada ao usuário
+      // 2. Remove do canal
+      const GROUP_ID = process.env.GROUP_ID;
+      if (GROUP_ID) {
+        try {
+          await bot.telegram.banChatMember(GROUP_ID, sub.user_id);
+          await bot.telegram.unbanChatMember(GROUP_ID, sub.user_id);
+          console.log(`[CRON] Usuário ${sub.user_id} removido do canal.`);
+        } catch (removeErr) {
+          console.warn(
+            `[CRON] Não foi possível remover ${sub.user_id} do canal:`,
+            removeErr.message
+          );
+        }
+      }
+
+      // 3. Notifica o usuário
       await bot.telegram.sendMessage(
         sub.user_id,
-        expirationMessage,
+        [
+          '⚠️ *Sua assinatura expirou\\!*',
+          '',
+          'Você foi removido do canal\\.',
+          'Renove seu plano para recuperar o acesso\\:',
+        ].join('\n'),
         {
-          parse_mode:  'MarkdownV2',
+          parse_mode: 'MarkdownV2',
           ...getRenewKeyboard(),
         }
       );
 
       console.log(`[CRON] Usuário ${sub.user_id} notificado. Status → expired.`);
-
     } catch (err) {
-      // Erros comuns: usuário bloqueou o bot (403), chat não encontrado (400).
-      // Não reverter o status — assinatura continua expirada mesmo sem notificação.
-      console.warn(
-        `[CRON] Não foi possível notificar usuário ${sub.user_id}:`,
-        err.message
-      );
+      console.warn(`[CRON] Não foi possível notificar usuário ${sub.user_id}:`, err.message);
     }
   }
 
