@@ -3,6 +3,7 @@
 // ══════════════════════════════════════════════════════════════════════════════
 //  server.js — Backend de Assinaturas: Mercado Pago Checkout Pro + Telegram Bot
 //  Stack: Node.js, Express, SQLite (sqlite3), Mercado Pago SDK v2, Axios
+//  Integração: Notifica o bot via API interna (POST /activate) ao aprovar pagamento
 // ══════════════════════════════════════════════════════════════════════════════
 
 require('dotenv').config();
@@ -23,20 +24,24 @@ const {
   PORT              = 3000,
   MP_ACCESS_TOKEN,
   TELEGRAM_BOT_TOKEN,
-  FRONTEND_URL      = 'https://seu-frontend.com',
-  BASE_URL          = 'https://seu-backend.com',
-  DB_PATH           = './payments.db',
+  FRONTEND_URL      = 'http://localhost:5173',
+  BASE_URL          = 'http://localhost:3000',
+  DB_PATH           = './data/payments.db',
   NODE_ENV          = 'development',
+  // URL interna do bot (dentro da rede Docker: http://bot:3001)
+  // Em dev local sem Docker: http://localhost:3001
+  BOT_INTERNAL_URL  = 'http://localhost:3001',
+  API_SECRET        = '',
 } = process.env;
 
-// Falha rápida: sem credenciais, sem serviço.
 if (!MP_ACCESS_TOKEN) {
   console.error('[FATAL] Variável de ambiente MP_ACCESS_TOKEN não definida.');
   process.exit(1);
 }
+
+// Aviso se TELEGRAM_BOT_TOKEN não estiver definido (ainda funciona, mas sem fallback Telegram direto)
 if (!TELEGRAM_BOT_TOKEN) {
-  console.error('[FATAL] Variável de ambiente TELEGRAM_BOT_TOKEN não definida.');
-  process.exit(1);
+  console.warn('[WARN] TELEGRAM_BOT_TOKEN não definida. Notificações diretas via Telegram desativadas.');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -66,6 +71,13 @@ const mpPayment    = new Payment(mpConfig);
 //  SEÇÃO 4 — BANCO DE DADOS SQLITE (wrappers assíncronos)
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Garante que o diretório de dados existe
+const fs = require('fs');
+const dataDir = path.dirname(DB_PATH);
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir, { recursive: true });
+}
+
 const db = new sqlite3.Database(DB_PATH, (err) => {
   if (err) {
     console.error('[DB][FATAL] Falha ao abrir o banco SQLite:', err.message);
@@ -74,29 +86,16 @@ const db = new sqlite3.Database(DB_PATH, (err) => {
   console.log(`[DB] Banco de dados SQLite conectado em: ${DB_PATH}`);
 });
 
-// WAL mode — melhor performance para múltiplas gravações
 db.run('PRAGMA journal_mode = WAL;');
 
-/**
- * Executa uma instrução SQL de escrita (INSERT, UPDATE, DELETE, CREATE).
- * @param {string} sql
- * @param {any[]} params
- * @returns {Promise<sqlite3.RunResult>}
- */
 const dbRun = (sql, params = []) =>
   new Promise((resolve, reject) => {
     db.run(sql, params, function callback(err) {
       if (err) return reject(err);
-      resolve(this); // `this` contém lastID e changes
+      resolve(this);
     });
   });
 
-/**
- * Retorna uma única linha do banco de dados.
- * @param {string} sql
- * @param {any[]} params
- * @returns {Promise<object | undefined>}
- */
 const dbGet = (sql, params = []) =>
   new Promise((resolve, reject) => {
     db.get(sql, params, (err, row) => {
@@ -105,9 +104,6 @@ const dbGet = (sql, params = []) =>
     });
   });
 
-/**
- * Cria as tabelas necessárias caso ainda não existam.
- */
 const initDatabase = async () => {
   await dbRun(`
     CREATE TABLE IF NOT EXISTS payments (
@@ -121,7 +117,6 @@ const initDatabase = async () => {
     )
   `);
 
-  // Índice para acelerar buscas por user_id no futuro
   await dbRun(`
     CREATE INDEX IF NOT EXISTS idx_payments_user_id
     ON payments (user_id)
@@ -135,47 +130,66 @@ const initDatabase = async () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Envia uma mensagem de texto para um usuário via Telegram Bot API.
- * @param {string|number} chatId  — ID do chat / user_id do Telegram
- * @param {string}        text    — Mensagem em HTML
+ * Notifica o Bot via API interna para ativar a assinatura do usuário.
+ * Essa é a integração principal backend → bot.
  */
-const sendTelegramMessage = async (chatId, text) => {
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+const notifyBotActivation = async ({ userId, planDays, amount, paymentRef }) => {
+  const url = `${BOT_INTERNAL_URL}/activate`;
 
   const payload = {
-    chat_id:    String(chatId),
-    text,
-    parse_mode: 'HTML',
+    userId:     Number(userId),
+    planDays:   Number(planDays),
+    amount:     Number(amount) || 0,
+    paymentRef: String(paymentRef),
+  };
+
+  const headers = {
+    'Content-Type': 'application/json',
+    ...(API_SECRET ? { 'X-Api-Secret': API_SECRET } : {}),
   };
 
   const response = await axios.post(url, payload, {
-    timeout: 6000,
-    headers: { 'Content-Type': 'application/json' },
+    timeout: 8000,
+    headers,
   });
 
-  if (!response.data?.ok) {
-    throw new Error(`Telegram retornou ok=false: ${JSON.stringify(response.data)}`);
+  if (!response.data?.success) {
+    throw new Error(`Bot retornou sucesso=false: ${JSON.stringify(response.data)}`);
   }
 
-  console.log(`[TELEGRAM] Mensagem enviada com sucesso → chat_id=${chatId}`);
+  console.log(`[BOT-NOTIFY] Assinatura ativada via bot → userId=${userId} | plano=${planDays}d`);
   return response.data;
 };
 
 /**
- * Formata a mensagem de confirmação de pagamento ao usuário.
- * @param {string|number} plano_dias
+ * Fallback: envia mensagem direta via Telegram API caso o bot esteja offline.
+ * Garante que o usuário seja notificado mesmo em falha do bot.
  */
-const buildApprovalMessage = (plano_dias) => {
+const sendTelegramFallback = async (chatId, plano_dias) => {
+  if (!TELEGRAM_BOT_TOKEN) {
+    console.warn('[TELEGRAM-FALLBACK] BOT_TOKEN não configurado. Pulando fallback.');
+    return;
+  }
+
   const plan = PLAN_CATALOG[parseInt(plano_dias, 10)];
   const label = plan ? plan.label : `${plano_dias} dias`;
 
-  return (
+  const text =
     `✅ <b>Pagamento Aprovado!</b>\n\n` +
     `Seu plano <b>${label}</b> foi ativado com sucesso!\n\n` +
     `🔓 <b>Acesso liberado imediatamente.</b>\n` +
     `📅 Duração: <b>${plano_dias} dias</b>\n\n` +
-    `Obrigado pela sua assinatura. Aproveite ao máximo! 🚀`
-  );
+    `Obrigado pela sua assinatura. Aproveite! 🚀`;
+
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+
+  await axios.post(url, {
+    chat_id:    String(chatId),
+    text,
+    parse_mode: 'HTML',
+  }, { timeout: 6000 });
+
+  console.log(`[TELEGRAM-FALLBACK] Mensagem direta enviada → chat_id=${chatId}`);
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -187,23 +201,32 @@ const app = express();
 // Serve páginas estáticas de /public (sucesso, falha, pendente)
 app.use(express.static(path.join(__dirname, 'public')));
 
-// CORS — permite apenas o frontend declarado no .env
+// CORS — permite o frontend declarado no .env + localhost em dev
+const allowedOrigins = [
+  FRONTEND_URL,
+  'http://localhost:5173',
+  'http://localhost:3000',
+].filter(Boolean);
+
 app.use(cors({
-  origin:         FRONTEND_URL,
+  origin: (origin, callback) => {
+    // Permite requisições sem origin (ex: curl, Postman, webhooks do MP)
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    callback(new Error(`CORS bloqueado para origem: ${origin}`));
+  },
   methods:        ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   optionsSuccessStatus: 200,
 }));
 
-// Parsers
 app.use(express.json({ limit: '10kb' }));
 app.use(express.urlencoded({ extended: false, limit: '10kb' }));
 
-// Logger de requisições
 app.use((req, _res, next) => {
   console.log(
-    `[REQ] ${new Date().toISOString()} | ${req.method} ${req.originalUrl} | ` +
-    `IP: ${req.ip}`
+    `[REQ] ${new Date().toISOString()} | ${req.method} ${req.originalUrl} | IP: ${req.ip}`
   );
   next();
 });
@@ -222,18 +245,10 @@ app.get('/health', (_req, res) => {
 });
 
 // ── POST /api/v1/checkout ─────────────────────────────────────────────────────
-/**
- * Cria uma preferência de pagamento no Mercado Pago e retorna o link do checkout.
- *
- * Body esperado: { "userId": "123456789", "plano": 30 }
- */
 app.post('/api/v1/checkout', async (req, res) => {
   const { userId, plano } = req.body;
 
-  // ── Validação de entrada ──────────────────────────────────────────────────
-
   if (!userId || String(userId).trim() === '') {
-    console.warn('[CHECKOUT] Requisição sem userId.');
     return res.status(400).json({ error: 'O campo "userId" é obrigatório.' });
   }
 
@@ -241,7 +256,6 @@ app.post('/api/v1/checkout', async (req, res) => {
   const planEntry = PLAN_CATALOG[planoInt];
 
   if (!planEntry) {
-    console.warn(`[CHECKOUT] Plano inválido recebido: "${plano}". userId=${userId}`);
     return res.status(400).json({
       error: 'Plano inválido. Os valores aceitos são: 7, 14 ou 30.',
     });
@@ -252,21 +266,15 @@ app.post('/api/v1/checkout', async (req, res) => {
   const now        = new Date().toISOString();
 
   try {
-    // ── 1. Persistir no banco com status 'pending' ────────────────────────
-
     await dbRun(
       `INSERT INTO payments (id, user_id, plano, status, created_at, updated_at)
        VALUES (?, ?, ?, 'pending', ?, ?)`,
       [id, safeUserId, planoInt, now, now]
     );
 
-    console.log(
-      `[CHECKOUT] Registro criado → id=${id} | userId=${safeUserId} | ` +
-      `plano=${planoInt}d | valor=R$${planEntry.price}`
-    );
+    console.log(`[CHECKOUT] Registro criado → id=${id} | userId=${safeUserId} | plano=${planoInt}d`);
 
-    // ── 2. Montar e enviar preferência ao Mercado Pago ────────────────────
-
+    // Monta back_urls apontando para o frontend
     const preferenceBody = {
       items: [
         {
@@ -278,32 +286,25 @@ app.post('/api/v1/checkout', async (req, res) => {
           currency_id: 'BRL',
         },
       ],
-      // Metadados injetados pelo backend — NUNCA pelo cliente
       metadata: {
         user_id:     safeUserId,
         plano_dias:  planoInt,
         internal_id: id,
       },
       back_urls: {
-        success: `${FRONTEND_URL}/sucesso`,
+        success: `${FRONTEND_URL}/sucesso?userId=${safeUserId}&plano=${planoInt}`,
         failure: `${FRONTEND_URL}/falha`,
         pending: `${FRONTEND_URL}/pendente`,
       },
-      auto_return:       'approved',
-      external_reference: id,
-      // URL de notificação registrada diretamente na preferência
-      notification_url:  `${BASE_URL}/api/v1/webhook`,
+      auto_return:          'approved',
+      external_reference:   id,
+      notification_url:     `${BASE_URL}/api/v1/webhook`,
       statement_descriptor: 'ASSINATURA BOT',
     };
 
     const preference = await mpPreference.create({ body: preferenceBody });
 
-    console.log(
-      `[CHECKOUT] Preferência MP criada → prefId=${preference.id} | ` +
-      `init_point=${preference.init_point}`
-    );
-
-    // ── 3. Retornar link do checkout ──────────────────────────────────────
+    console.log(`[CHECKOUT] Preferência MP criada → prefId=${preference.id}`);
 
     return res.status(201).json({
       success:    true,
@@ -312,14 +313,11 @@ app.post('/api/v1/checkout', async (req, res) => {
     });
 
   } catch (err) {
-    // Distingue erros do MP de erros internos no log
     const mpError = err?.cause?.message || err?.message || 'Erro desconhecido';
     console.error(`[CHECKOUT][ERROR] id=${id} | Erro: ${mpError}`);
 
-    // Remove registro órfão em caso de falha do MP
     try {
       await dbRun(`DELETE FROM payments WHERE id = ? AND status = 'pending'`, [id]);
-      console.warn(`[CHECKOUT] Registro órfão id=${id} removido do banco.`);
     } catch (dbErr) {
       console.error('[CHECKOUT][DB] Falha ao remover registro órfão:', dbErr.message);
     }
@@ -331,98 +329,62 @@ app.post('/api/v1/checkout', async (req, res) => {
 });
 
 // ── POST /api/v1/webhook ──────────────────────────────────────────────────────
-/**
- * Recebe notificações IPN do Mercado Pago.
- * Responde 200 imediatamente e processa de forma assíncrona para
- * evitar retentativas desnecessárias por parte do MP.
- */
 app.post('/api/v1/webhook', async (req, res) => {
   const body = req.body;
 
   console.log(
-    `[WEBHOOK] Notificação recebida → type=${body?.type} | ` +
-    `data.id=${body?.data?.id} | action=${body?.action}`
+    `[WEBHOOK] Notificação recebida → type=${body?.type} | data.id=${body?.data?.id}`
   );
 
-  // ── Resposta imediata ao Mercado Pago (evita timeout e retry) ─────────
+  // Resposta imediata ao MP (evita timeout e retry)
   res.status(200).json({ received: true });
 
-  // ── Filtra apenas eventos de pagamento com ID válido ──────────────────
   if (body?.type !== 'payment' || !body?.data?.id) {
-    console.log(`[WEBHOOK] Evento ignorado (type="${body?.type}"). Nenhuma ação necessária.`);
+    console.log(`[WEBHOOK] Evento ignorado (type="${body?.type}").`);
     return;
   }
 
   const mpPaymentId = String(body.data.id);
 
   try {
-    // ── 1. Consulta segura na API do Mercado Pago (server-to-server) ──────
-    //    NUNCA confie nos dados da notificação — sempre busque na API.
-
     console.log(`[WEBHOOK] Consultando pagamento na API do MP → id=${mpPaymentId}`);
     const paymentData = await mpPayment.get({ id: mpPaymentId });
 
     console.log(
-      `[WEBHOOK] Dados retornados pelo MP → id=${mpPaymentId} | ` +
-      `status=${paymentData.status} | amount=${paymentData.transaction_amount}`
+      `[WEBHOOK] Dados MP → id=${mpPaymentId} | status=${paymentData.status}`
     );
 
-    // ── 2. Processa apenas pagamentos 'approved' ──────────────────────────
-
     if (paymentData.status !== 'approved') {
-      console.log(
-        `[WEBHOOK] Pagamento ${mpPaymentId} com status="${paymentData.status}". ` +
-        `Nenhuma ação tomada.`
-      );
+      console.log(`[WEBHOOK] Status "${paymentData.status}" — sem ação.`);
       return;
     }
 
-    // ── 3. Extrai e valida metadata injetado pelo nosso backend ───────────
-
     const metadata    = paymentData.metadata || {};
-    // O MP converte camelCase para snake_case automaticamente
     const user_id     = metadata.user_id;
     const plano_dias  = metadata.plano_dias;
     const internal_id = metadata.internal_id;
 
     if (!user_id || !plano_dias || !internal_id) {
-      console.error(
-        `[WEBHOOK][ERROR] Metadata incompleto no pagamento ${mpPaymentId}:`,
-        JSON.stringify(metadata)
-      );
+      console.error(`[WEBHOOK][ERROR] Metadata incompleto:`, JSON.stringify(metadata));
       return;
     }
 
-    console.log(
-      `[WEBHOOK] Metadata extraído → internal_id=${internal_id} | ` +
-      `user_id=${user_id} | plano_dias=${plano_dias}`
-    );
-
-    // ── 4. Guarda de idempotência — evita processar o mesmo pagamento 2x ──
-
+    // Idempotência
     const existing = await dbGet(
-      `SELECT id, status FROM payments WHERE id = ?`,
-      [internal_id]
+      `SELECT id, status FROM payments WHERE id = ?`, [internal_id]
     );
 
     if (!existing) {
-      console.error(
-        `[WEBHOOK][ERROR] internal_id="${internal_id}" não encontrado no banco. ` +
-        `Possível pagamento fora do fluxo normal.`
-      );
+      console.error(`[WEBHOOK][ERROR] internal_id="${internal_id}" não encontrado no banco.`);
       return;
     }
 
     if (existing.status === 'approved') {
-      console.warn(
-        `[WEBHOOK] Pagamento internal_id="${internal_id}" já estava aprovado. ` +
-        `Notificação duplicada ignorada.`
-      );
+      console.warn(`[WEBHOOK] Notificação duplicada ignorada → internal_id="${internal_id}"`);
       return;
     }
 
-    // ── 5. Atualiza status no SQLite ──────────────────────────────────────
-
+    // Atualiza status no banco
     const updatedAt = new Date().toISOString();
     const result    = await dbRun(
       `UPDATE payments
@@ -430,35 +392,40 @@ app.post('/api/v1/webhook', async (req, res) => {
               mp_payment_id = ?,
               updated_at    = ?
         WHERE id = ?
-          AND status != 'approved'`,  // cláusula extra de segurança
+          AND status != 'approved'`,
       [mpPaymentId, updatedAt, internal_id]
     );
 
     if (result.changes === 0) {
-      console.warn(
-        `[WEBHOOK] UPDATE não afetou linhas para internal_id="${internal_id}". ` +
-        `Pode ser concorrência — ignorando.`
-      );
+      console.warn(`[WEBHOOK] UPDATE sem alteração → internal_id="${internal_id}"`);
       return;
     }
 
-    console.log(
-      `[WEBHOOK] Banco atualizado → internal_id=${internal_id} | ` +
-      `status=approved | mp_payment_id=${mpPaymentId}`
-    );
+    console.log(`[WEBHOOK] Pagamento aprovado → internal_id=${internal_id}`);
 
-    // ── 6. Notifica o usuário via Telegram ────────────────────────────────
+    // ── Notifica o bot para ativar a assinatura ───────────────────────────
+    try {
+      await notifyBotActivation({
+        userId:     user_id,
+        planDays:   plano_dias,
+        amount:     paymentData.transaction_amount,
+        paymentRef: mpPaymentId,
+      });
+    } catch (botErr) {
+      // Bot offline? Usa fallback direto via Telegram API
+      console.warn(
+        `[WEBHOOK] Bot inacessível (${botErr.message}). Usando fallback direto.`
+      );
+      try {
+        await sendTelegramFallback(user_id, plano_dias);
+      } catch (fbErr) {
+        console.error('[WEBHOOK] Fallback Telegram também falhou:', fbErr.message);
+      }
+    }
 
-    const message = buildApprovalMessage(plano_dias);
-    await sendTelegramMessage(user_id, message);
-
-    console.log(
-      `[WEBHOOK] Fluxo concluído com sucesso → ` +
-      `internal_id=${internal_id} | user_id=${user_id}`
-    );
+    console.log(`[WEBHOOK] Fluxo concluído → internal_id=${internal_id} | user_id=${user_id}`);
 
   } catch (err) {
-    // Erro não crítico após o 200 já ter sido enviado — apenas loga.
     console.error(
       `[WEBHOOK][ERROR] Falha ao processar pagamento ${mpPaymentId}: `,
       err?.response?.data || err?.message || err
@@ -470,12 +437,10 @@ app.post('/api/v1/webhook', async (req, res) => {
 //  SEÇÃO 8 — HANDLERS DE ERRO GLOBAIS
 // ─────────────────────────────────────────────────────────────────────────────
 
-// 404 — Rota não encontrada
 app.use((_req, res) => {
   res.status(404).json({ error: 'Rota não encontrada.' });
 });
 
-// 500 — Erro não tratado em middlewares
 // eslint-disable-next-line no-unused-vars
 app.use((err, _req, res, _next) => {
   console.error('[ERROR] Exceção não capturada no Express:', err.stack || err.message);
@@ -496,10 +461,10 @@ const bootstrap = async () => {
       console.log(`  🌍  Ambiente  : ${NODE_ENV}`);
       console.log(`  🔗  Frontend  : ${FRONTEND_URL}`);
       console.log(`  📡  Webhook   : ${BASE_URL}/api/v1/webhook`);
+      console.log(`  🤖  Bot URL   : ${BOT_INTERNAL_URL}`);
       console.log('═══════════════════════════════════════════════════════');
     });
 
-    // Graceful shutdown
     const shutdown = (signal) => {
       console.log(`\n[SERVER] Sinal ${signal} recebido. Encerrando...`);
       server.close(() => {

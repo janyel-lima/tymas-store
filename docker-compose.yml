@@ -1,0 +1,122 @@
+# ════════════════════════════════════════════════════════
+#  docker-compose.yml — Stack Completa de Produção
+#  Serviços: backend (Express+SQLite), bot (Telegraf), frontend (Nginx)
+#  Otimizado para AWS EC2 t3.micro (1GB RAM)
+# ════════════════════════════════════════════════════════
+
+services:
+  # ── Backend: Express + SQLite ───────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: mp-telegram-backend:latest
+    container_name: mp-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DB_PATH=/app/data/payments.db
+    volumes:
+      # Persistência do SQLite fora do container
+      - ./backend/data:/app/data
+    ports:
+      - '3000:3000'
+    networks:
+      - app-network
+    deploy:
+      resources:
+        limits:
+          memory: 250M
+        reservations:
+          memory: 128M
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://localhost:3000/health']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+  # ── Bot: Telegraf + better-sqlite3 ─────────────────────
+  bot:
+    build:
+      context: ./bot-one
+      dockerfile: Dockerfile
+    image: mp-telegram-bot:latest
+    container_name: mp-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - DB_PATH=/app/data/subscriptions.db
+      - API_PORT=3001
+      # Bot acessa o backend via rede interna do Docker
+      - BACKEND_INTERNAL_URL=http://backend:3000
+    volumes:
+      - ./bot-one/data:/app/data
+    ports:
+      # API interna do bot acessível apenas na rede interna
+      - '127.0.0.1:3001:3001'
+    networks:
+      - app-network
+    depends_on:
+      backend:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 150M
+        reservations:
+          memory: 64M
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+  # ── Frontend: Vue 3 servido via Nginx ───────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Vite precisa das URLs em build-time
+        VITE_BACKEND_URL: ${BACKEND_URL}
+        VITE_FRONTEND_URL: ${FRONTEND_URL}
+    image: mp-telegram-frontend:latest
+    container_name: mp-frontend
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - '80:80'
+    networks:
+      - app-network
+    depends_on:
+      backend:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 100M
+        reservations:
+          memory: 32M
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '5m'
+        max-file: '3'
+
+# ── Rede interna isolada ────────────────────────────────
+networks:
+  app-network:
+    driver: bridge
+    name: mp-telegram-network

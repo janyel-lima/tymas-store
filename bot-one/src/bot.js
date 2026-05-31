@@ -6,14 +6,14 @@
  */
 
 const { Telegraf } = require('telegraf');
-const { handleStart }    = require('./handlers/startHandler');
+const { handleStart } = require('./handlers/startHandler');
 const { handleCallback } = require('./handlers/callbackHandler');
 
-if (!process.env.BOT_TOKEN) {
-  throw new Error('❌ BOT_TOKEN não encontrado. Defina-o no arquivo .env');
+if (!process.env.TELEGRAM_BOT_TOKEN) {
+  throw new Error('❌ TELEGRAM_BOT_TOKEN não encontrado. Defina-o no arquivo .env');
 }
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
 // ─────────────────────────────────────────────
 // Middlewares globais
@@ -21,7 +21,7 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 
 /** Log de cada update recebido (desativável em produção via LOG_LEVEL) */
 bot.use(async (ctx, next) => {
-  const t0   = Date.now();
+  const t0 = Date.now();
   const type = ctx.updateType ?? 'unknown';
   const from = ctx.from ? `@${ctx.from.username ?? ctx.from.id}` : 'unknown';
 

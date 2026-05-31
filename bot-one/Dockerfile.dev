@@ -1,0 +1,21 @@
+# ════════════════════════════════════════════════════════
+#  bot-one/Dockerfile.dev — Desenvolvimento com nodemon
+# ════════════════════════════════════════════════════════
+FROM node:20-alpine
+
+RUN apk add --no-cache python3 make g++ && \
+    ln -sf python3 /usr/bin/python
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm install
+
+COPY . .
+RUN mkdir -p /app/data
+
+ENV NODE_ENV=development
+ENV DB_PATH=/app/data/subscriptions.db
+
+EXPOSE 3001
+CMD ["npx", "nodemon", "index.js"]

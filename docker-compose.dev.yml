@@ -1,0 +1,98 @@
+# ════════════════════════════════════════════════════════
+#  docker-compose.dev.yml — Modo Desenvolvimento Local
+# ════════════════════════════════════════════════════════
+services:
+  # ── Backend Dev ────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    image: mp-backend-dev:latest
+    container_name: mp-backend-dev
+    restart: unless-stopped
+    env_file:
+      - .env.dev
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+      - DB_PATH=/app/data/payments.db
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+      - ./backend/data:/app/data
+    ports:
+      - '3000:3000'
+    networks:
+      - app-network-dev
+    command: ['node', '--watch', 'server.js']
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '5m'
+        max-file: '2'
+
+  # ── Bot Dev ────────────────────────────────────────────
+  bot:
+    build:
+      context: ./bot-one
+      dockerfile: Dockerfile.dev
+    image: mp-bot-dev:latest
+    container_name: mp-bot-dev
+    restart: unless-stopped
+    env_file:
+      - .env.dev
+    environment:
+      - NODE_ENV=development
+      - DB_PATH=/app/data/subscriptions.db
+      - API_PORT=3001
+      - BACKEND_INTERNAL_URL=http://backend:3000
+    volumes:
+      - ./bot-one:/app
+      - /app/node_modules
+      - ./bot-one/data:/app/data
+    ports:
+      - '127.0.0.1:3001:3001'
+    networks:
+      - app-network-dev
+    depends_on:
+      - backend
+    command: ['npx', 'nodemon', 'index.js']
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '5m'
+        max-file: '2'
+
+  # ── Frontend Dev ───────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    image: mp-frontend-dev:latest
+    container_name: mp-frontend-dev
+    restart: unless-stopped
+    env_file:
+      - .env.dev
+    environment:
+      - VITE_BACKEND_URL=http://localhost:3000
+      - VITE_FRONTEND_URL=http://localhost:5173
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - '5173:5173'
+    networks:
+      - app-network-dev
+    depends_on:
+      - backend
+    command: ['npm', 'run', 'dev', '--', '--host', '0.0.0.0', '--port', '5173']
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '5m'
+        max-file: '2'
+
+networks:
+  app-network-dev:
+    driver: bridge
+    name: mp-telegram-network-dev

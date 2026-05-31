@@ -1,0 +1,20 @@
+# ════════════════════════════════════════════════════════
+#  backend/Dockerfile.dev — Desenvolvimento com hot-reload
+# ════════════════════════════════════════════════════════
+FROM node:20-alpine
+
+RUN apk add --no-cache python3 make g++
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm install
+
+COPY . .
+RUN mkdir -p /app/data
+
+ENV NODE_ENV=development
+ENV DB_PATH=/app/data/payments.db
+
+EXPOSE 3000
+CMD ["node", "--watch", "server.js"]
