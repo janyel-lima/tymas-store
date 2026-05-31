@@ -1,0 +1,29 @@
+# ─── Dependências ─────────────────────────────────────────────
+node_modules/
+
+# ─── Credenciais e variáveis de ambiente (NUNCA versionar) ────
+.env
+
+# ─── Banco de dados SQLite local ──────────────────────────────
+*.db
+*.db-shm
+*.db-wal
+
+# ─── Logs ─────────────────────────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+
+# ─── Sistema Operacional ──────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── Editores ─────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── Temporários ──────────────────────────────────────────────
+tmp/
+.tmp/

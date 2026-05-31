@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pagamento não realizado</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: linear-gradient(135deg, #1a0a0a, #2c1010, #3a1515);
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      color: #fff;
+      padding: 1.5rem;
+    }
+
+    .card {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      backdrop-filter: blur(14px);
+      border-radius: 24px;
+      padding: 3rem 2.5rem;
+      max-width: 480px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 25px 60px rgba(0, 0, 0, 0.5);
+      animation: fadeUp 0.6s cubic-bezier(0.22, 1, 0.36, 1) both;
+    }
+
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(32px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .icon-wrap {
+      width: 96px;
+      height: 96px;
+      background: linear-gradient(135deg, #e53935, #ff5252);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 1.75rem;
+      box-shadow: 0 0 40px rgba(229, 57, 53, 0.45);
+      animation: pop 0.5s 0.3s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+    }
+
+    @keyframes pop {
+      from { transform: scale(0); }
+      to   { transform: scale(1); }
+    }
+
+    .icon-wrap svg { width: 52px; height: 52px; fill: #fff; }
+
+    h1 {
+      font-size: 1.85rem;
+      font-weight: 700;
+      margin-bottom: 0.75rem;
+      letter-spacing: -0.5px;
+    }
+
+    .badge {
+      display: inline-block;
+      background: linear-gradient(135deg, #e53935, #ff5252);
+      color: #fff;
+      font-weight: 700;
+      font-size: 0.78rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 0.3rem 0.9rem;
+      border-radius: 999px;
+      margin-bottom: 1.4rem;
+    }
+
+    p {
+      color: rgba(255, 255, 255, 0.75);
+      font-size: 1.05rem;
+      line-height: 1.7;
+      margin-bottom: 1.25rem;
+    }
+
+    .info-box {
+      background: rgba(229, 57, 53, 0.12);
+      border: 1px solid rgba(229, 57, 53, 0.3);
+      border-radius: 12px;
+      padding: 1rem 1.25rem;
+      margin: 1.5rem 0;
+      color: rgba(255,255,255,0.85);
+      font-size: 0.95rem;
+      line-height: 1.7;
+      text-align: left;
+    }
+
+    .info-box ul { padding-left: 1.25rem; margin-top: 0.4rem; }
+    .info-box li { margin-bottom: 0.25rem; }
+
+    .btn {
+      display: inline-block;
+      margin-top: 0.5rem;
+      background: linear-gradient(135deg, #e53935, #ff5252);
+      color: #fff;
+      font-weight: 700;
+      font-size: 1rem;
+      text-decoration: none;
+      padding: 0.85rem 2rem;
+      border-radius: 12px;
+      transition: opacity 0.2s, transform 0.2s;
+      box-shadow: 0 6px 20px rgba(229, 57, 53, 0.35);
+    }
+
+    .btn:hover { opacity: 0.88; transform: translateY(-1px); }
+
+    .divider {
+      border: none;
+      border-top: 1px solid rgba(255,255,255,0.1);
+      margin: 1.75rem 0;
+    }
+
+    .footer-text {
+      font-size: 0.82rem;
+      color: rgba(255,255,255,0.4);
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon-wrap">
+      <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+        <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+      </svg>
+    </div>
+
+    <span class="badge">❌ Não aprovado</span>
+    <h1>Pagamento não realizado</h1>
+
+    <p>Infelizmente sua transação não foi concluída. Nenhum valor foi cobrado.</p>
+
+    <div class="info-box">
+      <strong>Possíveis motivos:</strong>
+      <ul>
+        <li>Saldo ou limite insuficiente no cartão</li>
+        <li>Dados do cartão incorretos</li>
+        <li>Transação recusada pelo banco emissor</li>
+        <li>Sessão de pagamento expirada</li>
+      </ul>
+    </div>
+
+    <a href="javascript:history.back()" class="btn">↩ Tentar novamente</a>
+
+    <hr class="divider" />
+
+    <p class="footer-text">
+      Se o problema persistir, entre em contato com o suporte via Telegram.
+    </p>
+  </div>
+</body>
+</html>

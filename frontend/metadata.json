@@ -1,0 +1,6 @@
+{
+  "name": "Checkout de Planos Telegram",
+  "description": "Interface de checkout e confirmação de sucesso para pagamento e liberação de acesso no Telegram.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
