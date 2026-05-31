@@ -4,24 +4,28 @@
  *  1. Roda diariamente à meia-noite (fuso America/Sao_Paulo)
  *  2. Encontra assinaturas com status 'active' e expires_at vencido
  *  3. Marca cada uma como 'expired' no banco
- *  4. Envia mensagem privada ao usuário notificando o vencimento
+ *  4. Remove o usuário do canal Telegram
+ *  5. Envia mensagem privada ao usuário notificando o vencimento
  */
 
 const cron = require('node-cron');
+const { formatInTimeZone } = require('date-fns-tz');
 const { getExpiredSubscriptions, expireSubscription } = require('../database');
 const { getRenewKeyboard } = require('../keyboards');
+
+const TZ = 'America/Sao_Paulo';
+const nowSP = () => formatInTimeZone(new Date(), TZ, "yyyy-MM-dd'T'HH:mm:ssxxx");
+const dateSP = date => formatInTimeZone(new Date(date), TZ, 'dd/MM/yyyy HH:mm');
 
 /**
  * Inicializa o cron job de expiração de assinaturas.
  * @param {import('telegraf').Telegraf} bot — instância do bot para envio de mensagens
  */
 function startCronJob(bot) {
-  // Expressão cron: "0 0 * * *" → toda meia-noite
-  const task = cron.schedule('0 0 * * *', async () => runExpirationCheck(bot), {
-    timezone: 'America/Sao_Paulo',
-  });
+  // Expressão cron: "0 0 * * *" → toda meia-noite no fuso de SP
+  const task = cron.schedule('0 0 * * *', async () => runExpirationCheck(bot), { timezone: TZ });
 
-  console.log('✅ Cron de expiração agendado: todo dia às 00:00 (America/Sao_Paulo)');
+  console.log(`✅ Cron de expiração agendado: todo dia às 00:00 (${TZ})`);
 
   // Executa imediatamente na inicialização para cobrir qualquer gap
   runExpirationCheck(bot);
@@ -35,8 +39,7 @@ function startCronJob(bot) {
  * @param {import('telegraf').Telegraf} bot
  */
 async function runExpirationCheck(bot) {
-  const timestamp = new Date().toISOString();
-  console.log(`[CRON] ${timestamp} — Iniciando verificação de assinaturas expiradas...`);
+  console.log(`[CRON] ${nowSP()} — Iniciando verificação de assinaturas expiradas...`);
 
   let expired;
   try {
@@ -47,44 +50,45 @@ async function runExpirationCheck(bot) {
   }
 
   if (expired.length === 0) {
-    console.log('[CRON] Nenhuma assinatura expirada encontrada.');
+    console.log(`[CRON] Nenhuma assinatura expirada encontrada. (${nowSP()})`);
     return;
   }
 
   console.log(`[CRON] ${expired.length} assinatura(s) a processar.`);
 
-  const expirationMessage = [
-    '⚠️ *Sua assinatura expirou\\!*',
-    '',
-    'Para continuar utilizando nossos serviços, renove',
-    'seu plano usando uma das opções abaixo\\:',
-  ].join('\n');
+  const GROUP_ID = process.env.GROUP_ID;
 
   for (const sub of expired) {
+    const expiresFmt = dateSP(sub.expires_at).replace(/\//g, '\\/').replace(':', '\\:');
+
     try {
-      // 1. Atualiza status no banco
+      // 1. Atualiza status no banco ANTES de notificar
+      //    (evita re-notificação em caso de falha parcial)
       expireSubscription(sub.user_id);
+      console.log(`[CRON] 🗄️  Status → expired | userId=${sub.user_id}`);
 
       // 2. Remove do canal
-      const GROUP_ID = process.env.GROUP_ID;
       if (GROUP_ID) {
         try {
           await bot.telegram.banChatMember(GROUP_ID, sub.user_id);
           await bot.telegram.unbanChatMember(GROUP_ID, sub.user_id);
-          console.log(`[CRON] Usuário ${sub.user_id} removido do canal.`);
+          console.log(`[CRON] ⛔ Usuário ${sub.user_id} removido do canal.`);
         } catch (removeErr) {
+          // Comum: usuário já saiu do canal manualmente (400/403)
           console.warn(
-            `[CRON] Não foi possível remover ${sub.user_id} do canal:`,
+            `[CRON] Não foi possível remover userId=${sub.user_id} do canal:`,
             removeErr.message
           );
         }
       }
 
-      // 3. Notifica o usuário
+      // 3. Notifica o usuário com data de vencimento e botões de renovação
       await bot.telegram.sendMessage(
         sub.user_id,
         [
           '⚠️ *Sua assinatura expirou\\!*',
+          '',
+          `Seu plano de *${sub.plan_days} dias* venceu em ${expiresFmt}\\.`,
           '',
           'Você foi removido do canal\\.',
           'Renove seu plano para recuperar o acesso\\:',
@@ -95,13 +99,17 @@ async function runExpirationCheck(bot) {
         }
       );
 
-      console.log(`[CRON] Usuário ${sub.user_id} notificado. Status → expired.`);
+      console.log(`[CRON] ✅ Usuário ${sub.user_id} notificado. Status → expired.`);
     } catch (err) {
-      console.warn(`[CRON] Não foi possível notificar usuário ${sub.user_id}:`, err.message);
+      // Erros comuns: usuário bloqueou o bot (403), chat não encontrado (400).
+      // Não reverte o status — assinatura permanece expirada mesmo sem notificação.
+      console.warn(`[CRON] Não foi possível processar userId=${sub.user_id}:`, err.message);
     }
   }
 
-  console.log(`[CRON] Verificação concluída. Processados: ${expired.length} usuário(s).`);
+  console.log(
+    `[CRON] Verificação concluída em ${nowSP()}. ` + `Processados: ${expired.length} usuário(s).`
+  );
 }
 
 module.exports = { startCronJob, runExpirationCheck };

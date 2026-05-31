@@ -3,29 +3,45 @@
 // ══════════════════════════════════════════════════════════════════════════════
 //  server.js — Backend de Assinaturas: Mercado Pago Checkout Pro + Telegram Bot
 //  Stack: Node.js, Express, SQLite (sqlite3), Mercado Pago SDK v2, Axios
-//  Integração: Notifica o bot via API interna (POST /activate) ao aprovar pagamento
+//  Melhorias: rate limiting, helmet, validação de assinatura MP, timezone SP,
+//             sanitização de userId, logs com timestamp SP
 // ══════════════════════════════════════════════════════════════════════════════
 
 require('dotenv').config();
 
+const crypto = require('crypto');
+const fs = require('fs');
 const path = require('path');
+
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const sqlite3 = require('sqlite3').verbose();
 const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
 const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
+const { formatInTimeZone } = require('date-fns-tz');
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SEÇÃO 1 — VARIÁVEIS DE AMBIENTE & VALIDAÇÃO NA INICIALIZAÇÃO
-//
-//  CORREÇÃO: Alterado de destructuring puro para atribuição com operador OR (||).
-//  O destructuring falha se a propriedade vier como string vazia ou nula do
-//  ambiente, mantendo valores indesejados. Agora a precedência do .env é absoluta.
+//  SEÇÃO 1 — CONSTANTES GLOBAIS
+// ─────────────────────────────────────────────────────────────────────────────
+
+const TZ = 'America/Sao_Paulo';
+
+/** Retorna timestamp atual no fuso de SP (para logs e registros). */
+const nowSP = () => formatInTimeZone(new Date(), TZ, "yyyy-MM-dd'T'HH:mm:ssxxx");
+
+/** Formata uma Date para exibição no fuso de SP. */
+const dateSP = date => formatInTimeZone(new Date(date), TZ, 'dd/MM/yyyy HH:mm');
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SEÇÃO 2 — VARIÁVEIS DE AMBIENTE & VALIDAÇÃO NA INICIALIZAÇÃO
 // ─────────────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+const MP_WEBHOOK_SECRET = process.env.MP_WEBHOOK_SECRET || '';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_BOT_USERNAME = process.env.TELEGRAM_BOT_USERNAME || '';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
@@ -44,8 +60,18 @@ if (!TELEGRAM_BOT_TOKEN) {
   console.warn('[WARN] TELEGRAM_BOT_TOKEN não definida. Fallback Telegram direto desativado.');
 }
 
+if (!MP_WEBHOOK_SECRET) {
+  console.warn(
+    '[WARN] MP_WEBHOOK_SECRET não definida. Validação de assinatura do webhook desativada.'
+  );
+}
+
+if (!API_SECRET) {
+  console.warn('[WARN] API_SECRET não definida. Comunicação com o bot sem autenticação!');
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-//  SEÇÃO 2 — MAPA DE PLANOS (única fonte de verdade de preços — server-side)
+//  SEÇÃO 3 — MAPA DE PLANOS (única fonte de verdade de preços — server-side)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** @type {Record<number, { price: number, label: string }>} */
@@ -56,7 +82,7 @@ const PLAN_CATALOG = Object.freeze({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SEÇÃO 3 — CLIENTE MERCADO PAGO (SDK v2)
+//  SEÇÃO 4 — CLIENTE MERCADO PAGO (SDK v2)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const mpConfig = new MercadoPagoConfig({
@@ -68,10 +94,9 @@ const mpPreference = new Preference(mpConfig);
 const mpPayment = new Payment(mpConfig);
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SEÇÃO 4 — BANCO DE DADOS SQLITE (wrappers assíncronos)
+//  SEÇÃO 5 — BANCO DE DADOS SQLITE (wrappers assíncronos)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const fs = require('fs');
 const dataDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dataDir)) {
   fs.mkdirSync(dataDir, { recursive: true });
@@ -125,8 +150,72 @@ const initDatabase = async () => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SEÇÃO 5 — HELPERS
+//  SEÇÃO 6 — HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Valida a assinatura HMAC-SHA256 enviada pelo Mercado Pago no header x-signature.
+ * Docs: https://www.mercadopago.com.br/developers/pt/docs/your-integrations/notifications/webhooks
+ *
+ * @param {import('express').Request} req
+ * @returns {boolean} true se válida (ou se MP_WEBHOOK_SECRET não está configurada)
+ */
+const validateMpSignature = req => {
+  if (!MP_WEBHOOK_SECRET) return true; // validação desativada, aviso já emitido no boot
+
+  const xSignature = req.headers['x-signature'];
+  const xRequestId = req.headers['x-request-id'];
+
+  if (!xSignature) {
+    console.warn('[WEBHOOK] Header x-signature ausente.');
+    return false;
+  }
+
+  // Formato: "ts=<timestamp>,v1=<hash>"
+  const parts = Object.fromEntries(
+    xSignature.split(',').map(part => part.split('=').map(s => s.trim()))
+  );
+
+  const ts = parts['ts'];
+  const v1 = parts['v1'];
+
+  if (!ts || !v1) {
+    console.warn('[WEBHOOK] Header x-signature mal formatado.');
+    return false;
+  }
+
+  const dataId = req.body?.data?.id ?? '';
+  const manifest = `id:${dataId};request-id:${xRequestId ?? ''};ts:${ts};`;
+
+  const expected = crypto.createHmac('sha256', MP_WEBHOOK_SECRET).update(manifest).digest('hex');
+
+  const valid = crypto.timingSafeEqual(Buffer.from(v1, 'utf8'), Buffer.from(expected, 'utf8'));
+
+  if (!valid) {
+    console.warn('[WEBHOOK] ⚠️  Assinatura inválida — possível requisição forjada.');
+  }
+
+  return valid;
+};
+
+/**
+ * Sanitiza e valida o userId recebido do frontend.
+ * IDs do Telegram são inteiros positivos de 5 a 15 dígitos.
+ *
+ * @param {unknown} raw
+ * @returns {{ ok: true, value: string } | { ok: false, error: string }}
+ */
+const sanitizeUserId = raw => {
+  const str = String(raw ?? '')
+    .trim()
+    .replace(/\D/g, '');
+  if (!str) return { ok: false, error: 'O campo "userId" é obrigatório.' };
+  if (str.length < 5)
+    return { ok: false, error: 'userId muito curto. Verifique seu ID do Telegram.' };
+  if (str.length > 15)
+    return { ok: false, error: 'userId muito longo. Verifique seu ID do Telegram.' };
+  return { ok: true, value: str };
+};
 
 /**
  * Notifica o Bot via API interna para ativar a assinatura do usuário.
@@ -146,10 +235,7 @@ const notifyBotActivation = async ({ userId, planDays, amount, paymentRef }) => 
     ...(API_SECRET ? { 'X-Api-Secret': API_SECRET } : {}),
   };
 
-  const response = await axios.post(url, payload, {
-    timeout: 8000,
-    headers,
-  });
+  const response = await axios.post(url, payload, { timeout: 8000, headers });
 
   if (!response.data?.success) {
     throw new Error(`Bot retornou sucesso=false: ${JSON.stringify(response.data)}`);
@@ -178,15 +264,9 @@ const sendTelegramFallback = async (chatId, plano_dias) => {
     `📅 Duração: <b>${plano_dias} dias</b>\n\n` +
     `Obrigado pela sua assinatura. Aproveite! 🚀`;
 
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-
   await axios.post(
-    url,
-    {
-      chat_id: String(chatId),
-      text,
-      parse_mode: 'HTML',
-    },
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+    { chat_id: String(chatId), text, parse_mode: 'HTML' },
     { timeout: 6000 }
   );
 
@@ -194,13 +274,22 @@ const sendTelegramFallback = async (chatId, plano_dias) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SEÇÃO 6 — EXPRESS APP & MIDDLEWARES
+//  SEÇÃO 7 — EXPRESS APP & MIDDLEWARES
 // ─────────────────────────────────────────────────────────────────────────────
 
 const app = express();
 
+// ── Segurança: headers HTTP ───────────────────────────────────────────────────
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+  })
+);
+
+// ── Arquivos estáticos (sucesso/falha/pendente) ───────────────────────────────
 app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
 
+// ── CORS ──────────────────────────────────────────────────────────────────────
 const allowedOrigins = [FRONTEND_URL, 'http://localhost:5173', 'http://localhost:3000'].filter(
   Boolean
 );
@@ -208,9 +297,7 @@ const allowedOrigins = [FRONTEND_URL, 'http://localhost:5173', 'http://localhost
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
+      if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
       callback(new Error(`CORS bloqueado para origem: ${origin}`));
     },
     methods: ['GET', 'POST', 'OPTIONS'],
@@ -219,49 +306,73 @@ app.use(
   })
 );
 
+// ── Body parsers ──────────────────────────────────────────────────────────────
 app.use(express.json({ limit: '10kb' }));
 app.use(express.urlencoded({ extended: false, limit: '10kb' }));
 
+// ── Rate Limiters ─────────────────────────────────────────────────────────────
+
+// Checkout: 5 tentativas por IP a cada 15 minutos
+const checkoutLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Muitas tentativas de checkout. Aguarde 15 minutos e tente novamente.' },
+  skip: req => NODE_ENV === 'development', // desativa em dev para não atrapalhar testes
+});
+
+// Webhook: 120 por minuto (MP pode reenviar várias vezes)
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Rate limit excedido no webhook.' },
+});
+
+// ── Log de requisições com timezone SP ───────────────────────────────────────
 app.use((req, _res, next) => {
-  console.log(
-    `[REQ] ${new Date().toISOString()} | ${req.method} ${req.originalUrl} | IP: ${req.ip}`
-  );
+  console.log(`[REQ] ${nowSP()} | ${req.method} ${req.originalUrl} | IP: ${req.ip}`);
   next();
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SEÇÃO 7 — ROTAS
+//  SEÇÃO 8 — ROTAS
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ── Health Check ──────────────────────────────────────────────────────────────
+// ── GET /health ───────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
   res.status(200).json({
     status: 'ok',
     env: NODE_ENV,
-    timestamp: new Date().toISOString(),
+    timestamp: nowSP(),
+    timezone: TZ,
   });
 });
 
 // ── POST /api/v1/checkout ─────────────────────────────────────────────────────
-app.post('/api/v1/checkout', async (req, res) => {
+app.post('/api/v1/checkout', checkoutLimiter, async (req, res) => {
   const { userId, plano } = req.body;
 
-  if (!userId || String(userId).trim() === '') {
-    return res.status(400).json({ error: 'O campo "userId" é obrigatório.' });
+  // Sanitiza e valida userId
+  const userIdResult = sanitizeUserId(userId);
+  if (!userIdResult.ok) {
+    return res.status(400).json({ error: userIdResult.error });
   }
+  const safeUserId = userIdResult.value;
 
+  // Valida plano
   const planoInt = parseInt(plano, 10);
   const planEntry = PLAN_CATALOG[planoInt];
-
   if (!planEntry) {
     return res.status(400).json({
       error: 'Plano inválido. Os valores aceitos são: 7, 14 ou 30.',
     });
   }
 
-  const safeUserId = String(userId).trim();
   const id = uuidv4();
-  const now = new Date().toISOString();
+  const now = nowSP();
 
   try {
     await dbRun(
@@ -277,7 +388,7 @@ app.post('/api/v1/checkout', async (req, res) => {
     const preferenceBody = {
       items: [
         {
-          id: id,
+          id,
           title: `Assinatura ${planEntry.label}`,
           description: `Acesso premium por ${planoInt} dias via Telegram`,
           quantity: 1,
@@ -327,12 +438,19 @@ app.post('/api/v1/checkout', async (req, res) => {
 });
 
 // ── POST /api/v1/webhook ──────────────────────────────────────────────────────
-app.post('/api/v1/webhook', async (req, res) => {
+app.post('/api/v1/webhook', webhookLimiter, async (req, res) => {
   const body = req.body;
 
   console.log(`[WEBHOOK] Notificação recebida → type=${body?.type} | data.id=${body?.data?.id}`);
 
+  // Responde 200 imediatamente (exigência do MP — timeout de 5s)
   res.status(200).json({ received: true });
+
+  // Valida assinatura HMAC do Mercado Pago
+  if (!validateMpSignature(req)) {
+    console.warn('[WEBHOOK] Requisição rejeitada por assinatura inválida.');
+    return;
+  }
 
   if (body?.type !== 'payment' || !body?.data?.id) {
     console.log(`[WEBHOOK] Evento ignorado (type="${body?.type}").`);
@@ -374,7 +492,7 @@ app.post('/api/v1/webhook', async (req, res) => {
       return;
     }
 
-    const updatedAt = new Date().toISOString();
+    const updatedAt = nowSP();
     const result = await dbRun(
       `UPDATE payments
           SET status        = 'approved',
@@ -390,7 +508,7 @@ app.post('/api/v1/webhook', async (req, res) => {
       return;
     }
 
-    console.log(`[WEBHOOK] Pagamento aprovado → internal_id=${internal_id}`);
+    console.log(`[WEBHOOK] Pagamento aprovado → internal_id=${internal_id} | ${nowSP()}`);
 
     try {
       await notifyBotActivation({
@@ -418,7 +536,7 @@ app.post('/api/v1/webhook', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SEÇÃO 8 — HANDLERS DE ERRO GLOBAIS
+//  SEÇÃO 9 — HANDLERS DE ERRO GLOBAIS
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.use((_req, res) => {
@@ -432,7 +550,7 @@ app.use((err, _req, res, _next) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SEÇÃO 9 — BOOTSTRAP
+//  SEÇÃO 10 — BOOTSTRAP
 // ─────────────────────────────────────────────────────────────────────────────
 
 const bootstrap = async () => {
@@ -443,10 +561,13 @@ const bootstrap = async () => {
       console.log('═══════════════════════════════════════════════════════');
       console.log(`  🚀  Servidor iniciado na porta ${PORT}`);
       console.log(`  🌍  Ambiente   : ${NODE_ENV}`);
+      console.log(`  🕐  Timezone   : ${TZ}`);
+      console.log(`  🕐  Hora SP    : ${nowSP()}`);
       console.log(`  🔗  Frontend   : ${FRONTEND_URL}`);
       console.log(`  📡  Webhook    : ${BACKEND_URL}/api/v1/webhook`);
       console.log(`  🤖  Bot URL    : ${BOT_INTERNAL_URL}`);
       console.log(`  🆔  Bot User   : ${TELEGRAM_BOT_USERNAME || '(não configurado)'}`);
+      console.log(`  🔐  MP Sig     : ${MP_WEBHOOK_SECRET ? '✅ ativa' : '⚠️  desativada'}`);
       console.log('═══════════════════════════════════════════════════════');
     });
 
@@ -459,6 +580,12 @@ const bootstrap = async () => {
           process.exit(0);
         });
       });
+
+      // Força encerramento após 10s se algo travar
+      setTimeout(() => {
+        console.error('[SERVER] Forçando encerramento após timeout.');
+        process.exit(1);
+      }, 10_000).unref();
     };
 
     process.on('SIGTERM', () => shutdown('SIGTERM'));

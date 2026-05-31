@@ -12,10 +12,20 @@
  */
 
 const express = require('express');
-const { activateSubscription, upsertUser, createPaymentRecord } = require('../database');
+const { formatInTimeZone } = require('date-fns-tz');
+
+const { activateSubscription, upsertUser, createPaymentRecord, getDb } = require('../database');
 const { registerPendingEntry } = require('../bot');
+
 const API_PORT = parseInt(process.env.API_PORT ?? '3001', 10);
 const API_SECRET = process.env.API_SECRET;
+const TZ = 'America/Sao_Paulo';
+
+/** Timestamp atual no fuso de SP. */
+const nowSP = () => formatInTimeZone(new Date(), TZ, "yyyy-MM-dd'T'HH:mm:ssxxx");
+
+/** Formata Date para exibição no fuso de SP. */
+const dateSP = date => formatInTimeZone(new Date(date), TZ, 'dd/MM/yyyy HH:mm');
 
 /**
  * Inicializa e inicia o servidor HTTP interno.
@@ -37,6 +47,7 @@ function startApiServer(bot) {
 
     const provided = req.headers['x-api-secret'];
     if (provided !== API_SECRET) {
+      console.warn(`[API] ⛔ Tentativa não autorizada → path=${req.path} | IP=${req.ip}`);
       return res.status(401).json({ error: 'Unauthorized: X-Api-Secret inválido.' });
     }
     next();
@@ -44,7 +55,11 @@ function startApiServer(bot) {
 
   // ── GET /health ────────────────────────────────────────────
   app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    res.json({
+      status: 'ok',
+      timestamp: nowSP(),
+      timezone: TZ,
+    });
   });
 
   // ── POST /activate ─────────────────────────────────────────
@@ -72,6 +87,9 @@ function startApiServer(bot) {
     if (isNaN(Number(userId)) || isNaN(Number(planDays))) {
       return res.status(400).json({ error: 'userId e planDays devem ser numéricos.' });
     }
+    if (Number(planDays) <= 0 || Number(planDays) > 365) {
+      return res.status(400).json({ error: 'planDays deve ser entre 1 e 365.' });
+    }
 
     try {
       // 1. Garante registro do usuário no banco
@@ -97,7 +115,7 @@ function startApiServer(bot) {
 
       console.log(
         `[API] ✅ Assinatura ativada — userId=${userId} | plano=${planDays}d | ` +
-          `expira=${expiresAt.toISOString()} | ref=${paymentRef ?? 'N/A'}`
+          `expira=${dateSP(expiresAt)} | ref=${paymentRef ?? 'N/A'}`
       );
 
       // 4. Gera link de convite único para o canal
@@ -115,25 +133,20 @@ function startApiServer(bot) {
           });
 
           inviteLink = linkResult.invite_link;
-          console.log(`[API] 🔗 Link gerado → userId=${userId} | link=${inviteLink}`);
+          console.log(`[API] 🔗 Link gerado → userId=${userId} | expira=${dateSP(expiresAt)}`);
 
-          // ── NOVO: registra userId como aguardando entrada ──
+          // Registra userId como aguardando entrada no canal
           registerPendingEntry(userId, {
             expiresAt,
             planDays: Number(planDays),
           });
-          // ──────────────────────────────────────────────────
         } catch (linkErr) {
           console.warn('[API] Falha ao gerar link de convite:', linkErr.message);
         }
       }
 
-      // 5. Formata data de expiração
-      const expiresFmt = expiresAt.toLocaleDateString('pt-BR', {
-        day: '2-digit',
-        month: '2-digit',
-        year: 'numeric',
-      });
+      // 5. Formata data de expiração no fuso de SP
+      const expiresFmt = dateSP(expiresAt).replace(/\//g, '\\/').replace(':', '\\:');
 
       // 6. Monta e envia mensagem no Telegram
       const messageLines = [
@@ -142,7 +155,7 @@ function startApiServer(bot) {
         'Sua assinatura foi ativada com sucesso\\.',
         '',
         `*📦 Plano:*       ${planDays} dias`,
-        `*📅 Válido até:*  ${expiresFmt.replace(/\//g, '\\/')}`,
+        `*📅 Válido até:*  ${expiresFmt}`,
         '',
       ];
 
@@ -162,9 +175,11 @@ function startApiServer(bot) {
         userId,
         planDays,
         expiresAt: expiresAt.toISOString(),
+        expiresSP: dateSP(expiresAt),
         inviteLink,
       });
     } catch (err) {
+      // Erro de notificação Telegram não deve impedir a ativação
       if (err.message?.includes('TELEGRAM') || err.response?.error_code) {
         console.warn('[API] Assinatura ativada, mas falha ao notificar usuário:', err.message);
         return res.status(200).json({
@@ -180,12 +195,90 @@ function startApiServer(bot) {
     }
   });
 
+  // ── GET /admin/stats ───────────────────────────────────────
+  /**
+   * Retorna estatísticas do banco: assinantes, receita, próximos a vencer.
+   * Protegido por X-Api-Secret (middleware global já cobre).
+   */
+  app.get('/admin/stats', (req, res) => {
+    try {
+      const db = getDb();
+
+      const total = db.prepare('SELECT COUNT(*) as n FROM users_subscriptions').get();
+      const ativos = db
+        .prepare("SELECT COUNT(*) as n FROM users_subscriptions WHERE status = 'active'")
+        .get();
+      const expirados = db
+        .prepare("SELECT COUNT(*) as n FROM users_subscriptions WHERE status = 'expired'")
+        .get();
+      const inativos = db
+        .prepare("SELECT COUNT(*) as n FROM users_subscriptions WHERE status = 'inactive'")
+        .get();
+      const receita = db
+        .prepare("SELECT SUM(amount) as total FROM payments WHERE status = 'approved'")
+        .get();
+
+      const proximosVencer = db
+        .prepare(
+          `
+        SELECT user_id, username, expires_at, plan_days
+          FROM users_subscriptions
+         WHERE status = 'active'
+           AND expires_at <= datetime('now', '+3 days')
+         ORDER BY expires_at ASC
+      `
+        )
+        .all();
+
+      const ultimosPagamentos = db
+        .prepare(
+          `
+        SELECT user_id, plan_days, amount, payment_ref, created_at
+          FROM payments
+         WHERE status = 'approved'
+         ORDER BY created_at DESC
+         LIMIT 5
+      `
+        )
+        .all();
+
+      res.json({
+        gerado_em: nowSP(),
+        timezone: TZ,
+        assinantes: {
+          total: total.n,
+          ativos: ativos.n,
+          expirados: expirados.n,
+          inativos: inativos.n,
+        },
+        receita_total: `R$ ${(receita.total || 0).toFixed(2)}`,
+        proximos_a_vencer: proximosVencer.map(s => ({
+          userId: s.user_id,
+          username: s.username ?? 'sem username',
+          expira: dateSP(s.expires_at),
+          plano: `${s.plan_days} dias`,
+        })),
+        ultimos_pagamentos: ultimosPagamentos.map(p => ({
+          userId: p.user_id,
+          plano: `${p.plan_days} dias`,
+          valor: `R$ ${Number(p.amount).toFixed(2)}`,
+          ref: p.payment_ref,
+          realizadoEm: dateSP(p.created_at),
+        })),
+      });
+    } catch (err) {
+      console.error('[API] Erro ao gerar stats:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ── POST /run-expiration-check (admin manual) ──────────────
   app.post('/run-expiration-check', async (req, res) => {
     try {
       const { runExpirationCheck } = require('../services/cronService');
+      console.log(`[API] 🔧 Verificação manual de expirações disparada → ${nowSP()}`);
       await runExpirationCheck(bot);
-      res.json({ success: true, message: 'Verificação executada.' });
+      res.json({ success: true, message: 'Verificação executada.', executadoEm: nowSP() });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -197,7 +290,7 @@ function startApiServer(bot) {
   });
 
   app.listen(API_PORT, '0.0.0.0', () => {
-    console.log(`✅ API interna rodando em http://0.0.0.0:${API_PORT}`);
+    console.log(`✅ API interna rodando em http://0.0.0.0:${API_PORT} | TZ: ${TZ}`);
   });
 
   return app;

@@ -1,9 +1,12 @@
 /**
  * bot.js
  * Cria e configura a instância do Telegraf.
+ * Registra middlewares, handlers de comandos e callbacks.
+ * Exporta `bot` como singleton para uso em todo o projeto.
  */
 
 const { Telegraf } = require('telegraf');
+const { formatInTimeZone } = require('date-fns-tz');
 const { handleStart } = require('./handlers/startHandler');
 const { handleCallback } = require('./handlers/callbackHandler');
 const { getSubscription } = require('./database');
@@ -12,17 +15,23 @@ if (!process.env.TELEGRAM_BOT_TOKEN) {
   throw new Error('❌ TELEGRAM_BOT_TOKEN não encontrado. Defina-o no arquivo .env');
 }
 
+const TZ = 'America/Sao_Paulo';
+const nowSP = () => formatInTimeZone(new Date(), TZ, "yyyy-MM-dd'T'HH:mm:ssxxx");
+const dateSP = date => formatInTimeZone(new Date(date), TZ, 'dd/MM/yyyy HH:mm');
+
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
 // ─────────────────────────────────────────────
 // Mapa de entradas pendentes de confirmação
-// userId → { expiresAt, planDays, confirmedAt }
+// userId → { expiresAt, planDays, registeredAt }
 // ─────────────────────────────────────────────
 const pendingConfirmations = new Map();
 
 /**
  * Registra um userId como aguardando entrada no canal.
  * Chamado pelo /activate após gerar o link.
+ * @param {number|string} userId
+ * @param {{ expiresAt: Date, planDays: number }} param1
  */
 function registerPendingEntry(userId, { expiresAt, planDays }) {
   pendingConfirmations.set(Number(userId), {
@@ -31,12 +40,18 @@ function registerPendingEntry(userId, { expiresAt, planDays }) {
     registeredAt: new Date(),
   });
 
+  console.log(
+    `[BOT] ⏳ Entrada pendente registrada → userId=${userId} | expira=${dateSP(expiresAt)}`
+  );
+
   // Remove da lista após 30 minutos se o usuário não entrar
   setTimeout(
     () => {
       if (pendingConfirmations.has(Number(userId))) {
         pendingConfirmations.delete(Number(userId));
-        console.log(`[BOT] ⏰ Confirmação pendente expirou → userId=${userId}`);
+        console.log(
+          `[BOT] ⏰ Confirmação pendente expirou (30min) → userId=${userId} | ${nowSP()}`
+        );
       }
     },
     30 * 60 * 1000
@@ -51,8 +66,10 @@ bot.use(async (ctx, next) => {
   const t0 = Date.now();
   const type = ctx.updateType ?? 'unknown';
   const from = ctx.from ? `@${ctx.from.username ?? ctx.from.id}` : 'unknown';
+
   await next();
-  console.log(`[BOT] ${type} de ${from} processado em ${Date.now() - t0}ms`);
+
+  console.log(`[BOT] ${nowSP()} | ${type} de ${from} processado em ${Date.now() - t0}ms`);
 });
 
 // ─────────────────────────────────────────────
@@ -62,7 +79,7 @@ bot.use(async (ctx, next) => {
 bot.start(handleStart);
 
 // ─────────────────────────────────────────────
-// Callback queries
+// Callback queries (botões inline)
 // ─────────────────────────────────────────────
 
 bot.on('callback_query', handleCallback);
@@ -89,28 +106,28 @@ bot.on('chat_member', async ctx => {
   const firstName = newMember.user.first_name ?? 'usuário';
   const escapedName = firstName.replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
 
-  console.log(`[BOT] 👤 Entrada no canal detectada → userId=${userId}`);
+  console.log(`[BOT] 👤 Entrada no canal detectada → userId=${userId} | ${nowSP()}`);
 
   // ── Valida se é o usuário esperado ──────────────────────
   const pending = pendingConfirmations.get(Number(userId));
 
   if (!pending) {
-    // Entrou sem ser esperado — pode ser acesso indevido
     console.warn(`[BOT] ⚠️ Entrada não esperada → userId=${userId}. Removendo do canal.`);
     try {
       await ctx.telegram.banChatMember(GROUP_ID, userId);
       await ctx.telegram.unbanChatMember(GROUP_ID, userId);
+      console.log(`[BOT] ⛔ userId=${userId} removido (entrada sem pagamento).`);
     } catch (err) {
       console.warn(`[BOT] Falha ao remover entrada indevida:`, err.message);
     }
     return;
   }
 
-  // ── Valida assinatura no banco ───────────────────────────
+  // ── Valida assinatura ativa no banco ─────────────────────
   const sub = getSubscription(userId);
 
   if (!sub || sub.status !== 'active') {
-    console.warn(`[BOT] ⚠️ Usuário sem assinatura ativa entrou → userId=${userId}. Removendo.`);
+    console.warn(`[BOT] ⚠️ Usuário sem assinatura ativa → userId=${userId}. Removendo.`);
     try {
       await ctx.telegram.banChatMember(GROUP_ID, userId);
       await ctx.telegram.unbanChatMember(GROUP_ID, userId);
@@ -124,14 +141,10 @@ bot.on('chat_member', async ctx => {
   // ── Tudo certo — confirma entrada ───────────────────────
   pendingConfirmations.delete(Number(userId));
 
-  const expiresFmt = pending.expiresAt.toLocaleDateString('pt-BR', {
-    day: '2-digit',
-    month: '2-digit',
-    year: 'numeric',
-  });
+  const expiresFmt = dateSP(pending.expiresAt).replace(/\//g, '\\/').replace(':', '\\:');
 
   console.log(
-    `[BOT] ✅ Entrada confirmada → userId=${userId} | expira=${pending.expiresAt.toISOString()}`
+    `[BOT] ✅ Entrada confirmada → userId=${userId} | expira=${dateSP(pending.expiresAt)}`
   );
 
   try {
@@ -142,7 +155,7 @@ bot.on('chat_member', async ctx => {
         '',
         `Bem\\-vindo\\(a\\) ao canal, ${escapedName}\\!`,
         '',
-        `*📅 Seu acesso é válido até:* ${expiresFmt.replace(/\//g, '\\/')}`,
+        `*📅 Seu acesso é válido até:* ${expiresFmt}`,
         '',
         '_Quando sua assinatura expirar, você será removido_',
         '_automaticamente e notificado aqui\\._',
@@ -159,7 +172,7 @@ bot.on('chat_member', async ctx => {
 // ─────────────────────────────────────────────
 
 bot.catch((err, ctx) => {
-  console.error(`[BOT] ❌ Erro no update "${ctx.updateType}":`, err.message ?? err);
+  console.error(`[BOT] ❌ ${nowSP()} | Erro no update "${ctx.updateType}":`, err.message ?? err);
 });
 
 module.exports = { bot, registerPendingEntry };
