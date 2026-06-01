@@ -1,0 +1,64 @@
+# ════════════════════════════════════════════════════════
+#  docker-compose.ngrok.yml — Override para tunneling ngrok
+#
+#  Uso (sempre combinado com o compose dev base):
+#    make dev-ngrok
+#    ou
+#    docker compose -f docker-compose.dev.yml -f docker-compose.ngrok.yml up --build
+#
+#  Pré-requisitos no .env.dev:
+#    NGROK_AUTHTOKEN=seu_token
+#    NGROK_STATIC_DOMAIN=seu-dominio.ngrok-free.app
+#    BACKEND_URL=https://seu-dominio.ngrok-free.app
+#    FRONTEND_URL=https://seu-dominio.ngrok-free.app
+#    BOT_INTERNAL_URL=http://bot:3001
+# ════════════════════════════════════════════════════════
+
+services:
+  # ── Gateway Nginx ─────────────────────────────────────
+  # Roteador interno: recebe tudo do ngrok e distribui
+  # para frontend ou backend pela rota da URL.
+  gateway:
+    image: nginx:alpine
+    container_name: mp-gateway-dev
+    restart: unless-stopped
+    volumes:
+      - ./gateway/nginx.dev.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - '8080:8080'
+    networks:
+      - app-network-dev
+    depends_on:
+      - backend
+      - frontend
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '5m'
+        max-file: '2'
+
+  # ── Ngrok Tunnel ──────────────────────────────────────
+  # Expõe gateway:8080 via HTTPS público com domínio estático.
+  # Um único domínio cobre frontend e backend (roteados pelo nginx acima).
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: mp-ngrok
+    restart: unless-stopped
+    command: >
+      http gateway:8080
+      --domain=${NGROK_STATIC_DOMAIN}
+      --log=stdout
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
+    ports:
+      # Painel de inspeção de requests do ngrok
+      - '4040:4040'
+    networks:
+      - app-network-dev
+    depends_on:
+      - gateway
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '5m'
+        max-file: '2'

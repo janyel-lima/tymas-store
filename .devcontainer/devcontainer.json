@@ -26,12 +26,14 @@
       }
     }
   },
-  "forwardPorts": [3000, 3001, 5173],
+  "forwardPorts": [3000, 3001, 5173, 8080, 4040],
   "portsAttributes": {
     "3000": { "label": "Backend (Express)", "onAutoForward": "notify" },
     "3001": { "label": "Bot API Interna", "onAutoForward": "silent" },
-    "5173": { "label": "Frontend (Vite)", "onAutoForward": "openBrowser" }
+    "5173": { "label": "Frontend (Vite)", "onAutoForward": "openBrowser" },
+    "8080": { "label": "Gateway Nginx", "onAutoForward": "silent" },
+    "4040": { "label": "Ngrok UI", "onAutoForward": "notify" }
   },
-  "postCreateCommand": "echo '✅ Dev container pronto! Acesse: http://localhost:5173 (frontend) e http://localhost:3000/health (backend)'",
+  "postCreateCommand": "echo '✅ Dev container pronto! Sem ngrok: http://localhost:5173 | Com ngrok: make dev-ngrok'",
   "remoteUser": "root"
 }

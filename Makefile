@@ -3,12 +3,16 @@
 #  Uso: make <comando>
 # ════════════════════════════════════════════════════════
 
-.PHONY: help dev prod down logs ps build-prod setup clean
+.PHONY: help dev dev-d dev-logs dev-down dev-ngrok dev-ngrok-d dev-ngrok-down \
+        prod down logs logs-backend logs-bot logs-frontend ps \
+        restart restart-backend restart-bot build-prod setup clean clean-all \
+        db-shell db-admin db-stats ngrok ngrok-logs ngrok-ui gateway-logs
 
 # Cores ANSI
 GREEN  = \033[0;32m
 YELLOW = \033[1;33m
 CYAN   = \033[0;36m
+RED    = \033[0;31m
 RESET  = \033[0m
 
 help: ## Mostra esta ajuda
@@ -18,21 +22,21 @@ help: ## Mostra esta ajuda
 	@echo "$(CYAN)╚══════════════════════════════════════════╝$(RESET)"
 	@echo ""
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
-	  awk 'BEGIN {FS = ":.*?## "}; {printf "  $(GREEN)%-20s$(RESET) %s\n", $$1, $$2}'
+	  awk 'BEGIN {FS = ":.*?## "}; {printf "  $(GREEN)%-22s$(RESET) %s\n", $$1, $$2}'
 	@echo ""
 
 setup: ## Configura o ambiente inicial (cria .env e diretórios de dados)
 	@echo "$(YELLOW)→ Configurando ambiente...$(RESET)"
 	@[ -f .env ] || (cp .env.example .env && echo "$(GREEN)✓ .env criado a partir de .env.example$(RESET)")
-	@[ -f .env.dev ] || echo "$(YELLOW)⚠ Crie .env.dev para desenvolvimento$(RESET)"
-	@mkdir -p backend/data bot-one/data
-	@echo "$(GREEN)✓ Diretórios de dados criados$(RESET)"
-	@echo "$(YELLOW)→ Edite o .env com suas credenciais antes de continuar$(RESET)"
+	@[ -f .env.dev ] || (cp .env.dev.example .env.dev && echo "$(GREEN)✓ .env.dev criado a partir de .env.dev.example$(RESET)")
+	@mkdir -p backend/data bot-one/data gateway
+	@echo "$(GREEN)✓ Diretórios criados$(RESET)"
+	@echo "$(YELLOW)→ Edite o .env.dev com suas credenciais antes de continuar$(RESET)"
 
-# ── Desenvolvimento ───────────────────────────────────────
-dev: ## Inicia todos os serviços em modo desenvolvimento (hot-reload)
+# ── Desenvolvimento (local, sem túnel) ───────────────────
+dev: ## Inicia stack de desenvolvimento com hot-reload (sem ngrok)
 	@echo "$(CYAN)→ Iniciando stack de desenvolvimento...$(RESET)"
-	@[ -f .env.dev ] || (echo "$(YELLOW)⚠ .env.dev não encontrado. Copiando de .env.dev.example...$(RESET)" && cp .env.example .env.dev)
+	@[ -f .env.dev ] || (echo "$(YELLOW)⚠ .env.dev não encontrado. Copiando de .env.dev.example...$(RESET)" && cp .env.dev.example .env.dev)
 	docker compose -f docker-compose.dev.yml up --build
 
 dev-d: ## Inicia em modo desenvolvimento em background (detached)
@@ -43,6 +47,24 @@ dev-logs: ## Logs do modo desenvolvimento
 
 dev-down: ## Para o modo desenvolvimento
 	docker compose -f docker-compose.dev.yml down
+
+# ── Desenvolvimento com ngrok (webhooks do MP funcionam) ──
+dev-ngrok: ## Inicia stack dev + gateway nginx + túnel ngrok estático
+	@echo "$(CYAN)→ Verificando configuração ngrok...$(RESET)"
+	@[ -f .env.dev ] || (echo "$(RED)✗ .env.dev não encontrado! Execute: make setup$(RESET)" && exit 1)
+	@grep -q "^NGROK_AUTHTOKEN=.\+" .env.dev || \
+	  (echo "$(RED)✗ NGROK_AUTHTOKEN não definido no .env.dev$(RESET)" && exit 1)
+	@grep -q "^NGROK_STATIC_DOMAIN=.\+" .env.dev || \
+	  (echo "$(RED)✗ NGROK_STATIC_DOMAIN não definido no .env.dev$(RESET)" && exit 1)
+	@echo "$(GREEN)✓ Configuração ngrok válida$(RESET)"
+	@echo "$(CYAN)→ Iniciando stack com túnel ngrok...$(RESET)"
+	docker compose -f docker-compose.dev.yml -f docker-compose.ngrok.yml up --build
+
+dev-ngrok-d: ## Inicia stack dev + ngrok em background (detached)
+	docker compose -f docker-compose.dev.yml -f docker-compose.ngrok.yml up --build -d
+
+dev-ngrok-down: ## Para stack dev + ngrok
+	docker compose -f docker-compose.dev.yml -f docker-compose.ngrok.yml down
 
 # ── Produção ──────────────────────────────────────────────
 prod: ## Inicia todos os serviços em modo produção
@@ -58,7 +80,7 @@ build-prod: ## Apenas faz o build das imagens de produção (sem subir)
 down: ## Para todos os serviços de produção
 	docker compose down
 
-# ── Utilitários ───────────────────────────────────────────
+# ── Logs ─────────────────────────────────────────────────
 logs: ## Logs de produção em tempo real (todos os serviços)
 	docker compose logs -f
 
@@ -71,6 +93,13 @@ logs-bot: ## Logs apenas do bot
 logs-frontend: ## Logs apenas do frontend (Nginx)
 	docker compose logs -f frontend
 
+ngrok-logs: ## Logs do container ngrok
+	docker compose -f docker-compose.dev.yml -f docker-compose.ngrok.yml logs -f ngrok
+
+gateway-logs: ## Logs do gateway nginx
+	docker compose -f docker-compose.dev.yml -f docker-compose.ngrok.yml logs -f gateway
+
+# ── Status e controle ─────────────────────────────────────
 ps: ## Status dos containers
 	@echo ""
 	docker compose ps
@@ -95,10 +124,24 @@ db-admin: ## Executa db-admin.js (listar pagamentos)
 db-stats: ## Exibe estatísticas do banco
 	docker compose exec backend node db-admin.js stats
 
+# ── Ngrok utilitários ─────────────────────────────────────
+ngrok-ui: ## Abre o painel de inspeção do ngrok (inspecionar requests)
+	@echo "$(CYAN)→ Painel ngrok disponível em: http://localhost:4040$(RESET)"
+	@open http://localhost:4040 2>/dev/null || \
+	  xdg-open http://localhost:4040 2>/dev/null || \
+	  echo "$(YELLOW)→ Acesse manualmente: http://localhost:4040$(RESET)"
+
+ngrok: ## Expõe o backend diretamente via ngrok (binário local, sem Docker)
+	@which ngrok > /dev/null 2>&1 || (echo "$(YELLOW)⚠ Instale ngrok: https://ngrok.com$(RESET)" && exit 1)
+	@echo "$(CYAN)→ Expondo backend na porta 3000 via ngrok...$(RESET)"
+	@echo "$(YELLOW)→ Copie a URL HTTPS e atualize BACKEND_URL no .env.dev$(RESET)"
+	ngrok http 3000
+
 # ── Manutenção ────────────────────────────────────────────
 clean: ## Remove containers, imagens e volumes não utilizados
 	@echo "$(YELLOW)→ Limpando recursos Docker...$(RESET)"
 	docker compose down --remove-orphans
+	docker compose -f docker-compose.dev.yml down --remove-orphans 2>/dev/null || true
 	docker image prune -f
 	docker volume prune -f
 	@echo "$(GREEN)✓ Limpeza concluída$(RESET)"
@@ -107,13 +150,7 @@ clean-all: ## Remove TUDO incluindo volumes persistentes (⚠ apaga dados!)
 	@echo "$(YELLOW)⚠ ATENÇÃO: Isso apagará o banco de dados SQLite!$(RESET)"
 	@read -p "Confirme digitando 'sim': " confirm && [ "$$confirm" = "sim" ] || exit 1
 	docker compose down -v --remove-orphans
+	docker compose -f docker-compose.dev.yml -f docker-compose.ngrok.yml down -v --remove-orphans 2>/dev/null || true
 	docker image rm mp-telegram-backend mp-telegram-bot mp-telegram-frontend 2>/dev/null || true
 	rm -rf backend/data bot-one/data
 	@echo "$(GREEN)✓ Limpeza total concluída$(RESET)"
-
-# ── Ngrok (Dev com webhooks) ──────────────────────────────
-ngrok: ## Expõe o backend via ngrok (necessário para webhooks do MP em dev)
-	@which ngrok > /dev/null 2>&1 || (echo "$(YELLOW)⚠ Instale ngrok: https://ngrok.com$(RESET)" && exit 1)
-	@echo "$(CYAN)→ Expondo backend na porta 3000 via ngrok...$(RESET)"
-	@echo "$(YELLOW)→ Copie a URL HTTPS e atualize BACKEND_URL no .env.dev$(RESET)"
-	ngrok http 3000
